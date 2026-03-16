@@ -147,6 +147,12 @@ router.post('/team-group/add', authMiddleware, async (req, res) => {
       return res.status(403).json({ success: false, message: '权限不足' });
     }
     
+    // 验证分成比例
+    const finalCommission = commission || 0.05;
+    if (finalCommission > 0.2) {
+      return res.status(400).json({ success: false, message: '组长分成比例不得超过20%' });
+    }
+    
     // 检查组名是否已存在
     const existingGroup = await TeamGroup.findOne({ teamLeaderId, groupName });
     if (existingGroup) {
@@ -167,7 +173,7 @@ router.post('/team-group/add', authMiddleware, async (req, res) => {
       groupName,
       groupLeaderId: groupLeaderId || null,
       groupLeaderName: groupLeaderName || null,
-      commission: commission || 0.05,
+      commission: finalCommission,
       memberCount: 0
     });
     
@@ -223,6 +229,12 @@ router.post('/group-leader/add', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, message: '缺少必要参数' });
     }
     
+    // 验证分成比例
+    const finalCommission = commission || 0.05;
+    if (finalCommission > 0.2) {
+      return res.status(400).json({ success: false, message: '组长分成比例不得超过20%' });
+    }
+    
     // 验证权限
     if (req.user.role !== 'superadmin') {
       // 团队长只能创建自己团队的组长
@@ -252,7 +264,7 @@ router.post('/group-leader/add', authMiddleware, async (req, res) => {
       teamName,
       teamGroupId,
       groupName,
-      commission: commission || 0.05,
+      commission: finalCommission,
       realName
     });
     
@@ -348,7 +360,12 @@ router.put('/group-leader/:id', authMiddleware, async (req, res) => {
     if (teamName !== undefined) groupLeader.teamName = teamName;
     if (teamGroupId !== undefined) groupLeader.teamGroupId = teamGroupId;
     if (groupName !== undefined) groupLeader.groupName = groupName;
-    if (commission !== undefined) groupLeader.commission = commission;
+    if (commission !== undefined) {
+      if (commission > 0.2) {
+        return res.status(400).json({ success: false, message: '组长分成比例不得超过20%' });
+      }
+      groupLeader.commission = commission;
+    }
     if (status !== undefined) groupLeader.status = status;
     if (phone !== undefined) groupLeader.phone = phone;
     if (region !== undefined) groupLeader.region = region;
@@ -470,6 +487,9 @@ router.put('/team-group/:id', authMiddleware, async (req, res) => {
     }
     
     if (commission !== undefined) {
+      if (commission > 0.2) {
+        return res.status(400).json({ success: false, message: '组长分成比例不得超过20%' });
+      }
       group.commission = commission;
     }
     

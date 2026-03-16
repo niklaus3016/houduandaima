@@ -309,6 +309,83 @@ router.get('/group-leader/list', authMiddleware, async (req, res) => {
   }
 });
 
+// 编辑组长API
+router.put('/group-leader/:id', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { username, password, realName, teamName, teamGroupId, groupName, commission, status } = req.body;
+    
+    const groupLeader = await Admin.findById(id);
+    if (!groupLeader) {
+      return res.status(404).json({ success: false, message: '组长不存在' });
+    }
+    
+    // 验证权限
+    if (req.user.role !== 'superadmin') {
+      // 团队长只能编辑自己团队的组长
+      const teamLeader = await Admin.findById(req.user.id);
+      if (teamLeader && teamLeader.teamName !== groupLeader.teamName) {
+        return res.status(403).json({ success: false, message: '权限不足' });
+      }
+    }
+    
+    // 如果要更新用户名，检查是否已被其他用户使用
+    if (username && username !== groupLeader.username) {
+      const existingAdmin = await Admin.findOne({ 
+        username, 
+        _id: { $ne: id } 
+      });
+      if (existingAdmin) {
+        return res.status(400).json({ success: false, message: '用户名已存在' });
+      }
+      groupLeader.username = username;
+    }
+    
+    if (password) {
+      groupLeader.password = hashPassword(password);
+    }
+    if (realName !== undefined) groupLeader.realName = realName;
+    if (teamName !== undefined) groupLeader.teamName = teamName;
+    if (teamGroupId !== undefined) groupLeader.teamGroupId = teamGroupId;
+    if (groupName !== undefined) groupLeader.groupName = groupName;
+    if (commission !== undefined) groupLeader.commission = commission;
+    if (status !== undefined) groupLeader.status = status;
+    
+    groupLeader.updatedAt = new Date();
+    await groupLeader.save();
+    
+    // 如果更新了组信息，同步更新TeamGroup表
+    if (teamGroupId || groupName || realName) {
+      const group = await TeamGroup.findOne({ groupLeaderId: id });
+      if (group) {
+        if (groupName) group.groupName = groupName;
+        if (realName) group.groupLeaderName = realName;
+        await group.save();
+      }
+    }
+    
+    res.json({
+      success: true,
+      message: '组长更新成功',
+      data: {
+        _id: groupLeader._id,
+        username: groupLeader.username,
+        role: groupLeader.role,
+        teamName: groupLeader.teamName,
+        teamGroupId: groupLeader.teamGroupId,
+        groupName: groupLeader.groupName,
+        commission: groupLeader.commission,
+        realName: groupLeader.realName,
+        status: groupLeader.status,
+        createdAt: groupLeader.createdAt
+      }
+    });
+  } catch (error) {
+    console.error('更新组长错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
 // 编辑组API
 router.put('/team-group/:id', authMiddleware, async (req, res) => {
   try {

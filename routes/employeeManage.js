@@ -21,7 +21,7 @@ function generateEmployeeId() {
 // 创建员工账号
 router.post('/create', authMiddleware, async (req, res) => {
   try {
-    const { parentId, realName, phone, region } = req.body;
+    const { parentId, realName, phone, region, teamGroupId, groupName } = req.body;
     
     if (!realName) {
       return res.status(400).json({ success: false, message: '请填写员工姓名' });
@@ -51,6 +51,8 @@ router.post('/create', authMiddleware, async (req, res) => {
       phone: phone || '',
       region: region || '',
       phoneCount: 0,
+      teamGroupId: teamGroupId || null,
+      groupName: groupName || null,
       status: 'enabled',
       role: 'EMPLOYEE'
     });
@@ -68,7 +70,9 @@ router.post('/create', authMiddleware, async (req, res) => {
         region: newEmployee.region,
         employeeId: newEmployee.employeeId,
         role: newEmployee.role,
-        status: newEmployee.status
+        status: newEmployee.status,
+        teamGroupId: newEmployee.teamGroupId,
+        groupName: newEmployee.groupName
       }
     });
   } catch (error) {
@@ -120,6 +124,8 @@ router.get('/list', authMiddleware, async (req, res) => {
         role: emp.role || 'EMPLOYEE',
         status: emp.status,
         phoneCount: emp.phoneCount || 0,
+        teamGroupId: emp.teamGroupId || null,
+        groupName: emp.groupName || null,
         createdAt: emp.createdAt
       };
     }));
@@ -166,6 +172,8 @@ router.put('/:id', authMiddleware, async (req, res) => {
     if (realName !== undefined) employee.realName = realName;
     if (phone !== undefined) employee.phone = phone;
     if (region !== undefined) employee.region = region;
+    if (teamGroupId !== undefined) employee.teamGroupId = teamGroupId;
+    if (groupName !== undefined) employee.groupName = groupName;
     if (req.body.phoneCount !== undefined) employee.phoneCount = req.body.phoneCount;
     
     employee.updatedAt = new Date();

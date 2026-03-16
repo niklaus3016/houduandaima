@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const Admin = require('../models/Admin');
+const TeamGroup = require('../models/TeamGroup');
+const Employee = require('../models/Employee');
 const { generateToken, hashPassword, comparePassword } = require('../utils/auth');
 const authMiddleware = require('../middleware/auth');
 
@@ -59,6 +61,8 @@ router.post('/login', async (req, res) => {
           username: admin.username,
           role: admin.role,
           teamName: admin.teamName || '',
+          teamGroupId: admin.teamGroupId || null,
+          groupName: admin.groupName || null,
           commission: admin.commission || 0
         },
         token
@@ -86,6 +90,8 @@ router.get('/me', authMiddleware, async (req, res) => {
         username: admin.username,
         role: admin.role,
         teamName: admin.teamName || '',
+        teamGroupId: admin.teamGroupId || null,
+        groupName: admin.groupName || null,
         commission: admin.commission || 0,
         createdAt: admin.createdAt
       }
@@ -123,6 +129,280 @@ router.post('/update-password', authMiddleware, async (req, res) => {
     res.json({ success: true, message: '密码修改成功' });
   } catch (error) {
     console.error('修改密码错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 新增组API
+router.post('/team-group/add', authMiddleware, async (req, res) => {
+  try {
+    const { teamLeaderId, teamName, groupName, groupLeaderId, commission } = req.body;
+    
+    if (!teamLeaderId || !teamName || !groupName) {
+      return res.status(400).json({ success: false, message: '缺少必要参数' });
+    }
+    
+    // 验证权限
+    if (req.user.role !== 'superadmin' && req.user.id.toString() !== teamLeaderId) {
+      return res.status(403).json({ success: false, message: '权限不足' });
+    }
+    
+    // 检查组名是否已存在
+    const existingGroup = await TeamGroup.findOne({ teamLeaderId, groupName });
+    if (existingGroup) {
+      return res.status(400).json({ success: false, message: '该团队下已存在同名组' });
+    }
+    
+    let groupLeaderName = null;
+    if (groupLeaderId) {
+      const leader = await Admin.findById(groupLeaderId);
+      if (leader) {
+        groupLeaderName = leader.realName || leader.username;
+      }
+    }
+    
+    const newGroup = new TeamGroup({
+      teamLeaderId,
+      teamName,
+      groupName,
+      groupLeaderId: groupLeaderId || null,
+      groupLeaderName: groupLeaderName || null,
+      commission: commission || 0.1,
+      memberCount: 0
+    });
+    
+    await newGroup.save();
+    
+    res.json({
+      success: true,
+      message: '组创建成功',
+      data: newGroup
+    });
+  } catch (error) {
+    console.error('创建组错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 组列表API
+router.get('/team-group/list', authMiddleware, async (req, res) => {
+  try {
+    const { teamLeaderId, teamName } = req.query;
+    
+    let query = {};
+    if (teamLeaderId) {
+      query.teamLeaderId = teamLeaderId;
+    }
+    if (teamName) {
+      query.teamName = teamName;
+    }
+    
+    // 验证权限
+    if (req.user.role !== 'superadmin') {
+      query.teamLeaderId = req.user.id.toString();
+    }
+    
+    const groups = await TeamGroup.find(query).sort({ createdAt: -1 });
+    
+    res.json({
+      success: true,
+      data: groups
+    });
+  } catch (error) {
+    console.error('获取组列表错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 新增组长API
+router.post('/group-leader/add', authMiddleware, async (req, res) => {
+  try {
+    const { username, password, realName, teamName, teamGroupId, groupName, commission } = req.body;
+    
+    if (!username || !password || !realName || !teamName || !teamGroupId || !groupName) {
+      return res.status(400).json({ success: false, message: '缺少必要参数' });
+    }
+    
+    // 验证权限
+    if (req.user.role !== 'superadmin') {
+      // 团队长只能创建自己团队的组长
+      const teamLeader = await Admin.findById(req.user.id);
+      if (teamLeader && teamLeader.teamName !== teamName) {
+        return res.status(403).json({ success: false, message: '权限不足' });
+      }
+    }
+    
+    // 检查用户名是否已存在
+    const existingAdmin = await Admin.findOne({ username });
+    if (existingAdmin) {
+      return res.status(400).json({ success: false, message: '用户名已存在' });
+    }
+    
+    // 检查组是否存在
+    const group = await TeamGroup.findById(teamGroupId);
+    if (!group) {
+      return res.status(404).json({ success: false, message: '组不存在' });
+    }
+    
+    // 创建组长账号
+    const newGroupLeader = new Admin({
+      username,
+      password: hashPassword(password),
+      role: 'NORMAL_ADMIN', // 组长使用NORMAL_ADMIN角色
+      teamName,
+      teamGroupId,
+      groupName,
+      commission: commission || 0.1,
+      realName
+    });
+    
+    await newGroupLeader.save();
+    
+    // 更新组的组长信息
+    group.groupLeaderId = newGroupLeader._id.toString();
+    group.groupLeaderName = realName;
+    await group.save();
+    
+    res.json({
+      success: true,
+      message: '组长创建成功',
+      data: newGroupLeader
+    });
+  } catch (error) {
+    console.error('创建组长错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 组长列表API
+router.get('/group-leader/list', authMiddleware, async (req, res) => {
+  try {
+    const { teamLeaderId, teamName } = req.query;
+    
+    let query = {
+      role: 'NORMAL_ADMIN',
+      teamGroupId: { $ne: null }
+    };
+    
+    if (teamName) {
+      query.teamName = teamName;
+    }
+    
+    // 验证权限
+    if (req.user.role !== 'superadmin') {
+      // 团队长只能查看自己团队的组长
+      const teamLeader = await Admin.findById(req.user.id);
+      if (teamLeader) {
+        query.teamName = teamLeader.teamName;
+      }
+    }
+    
+    const groupLeaders = await Admin.find(query).sort({ createdAt: -1 });
+    
+    res.json({
+      success: true,
+      data: groupLeaders
+    });
+  } catch (error) {
+    console.error('获取组长列表错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 编辑组API
+router.put('/team-group/:id', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { groupName, groupLeaderId, commission } = req.body;
+    
+    const group = await TeamGroup.findById(id);
+    if (!group) {
+      return res.status(404).json({ success: false, message: '组不存在' });
+    }
+    
+    // 验证权限
+    if (req.user.role !== 'superadmin' && req.user.id.toString() !== group.teamLeaderId) {
+      return res.status(403).json({ success: false, message: '权限不足' });
+    }
+    
+    if (groupName) {
+      // 检查新组名是否已存在
+      const existingGroup = await TeamGroup.findOne({ 
+        teamLeaderId: group.teamLeaderId, 
+        groupName, 
+        _id: { $ne: id } 
+      });
+      if (existingGroup) {
+        return res.status(400).json({ success: false, message: '该团队下已存在同名组' });
+      }
+      group.groupName = groupName;
+    }
+    
+    if (groupLeaderId) {
+      const leader = await Admin.findById(groupLeaderId);
+      if (leader) {
+        group.groupLeaderId = groupLeaderId;
+        group.groupLeaderName = leader.realName || leader.username;
+      }
+    }
+    
+    if (commission !== undefined) {
+      group.commission = commission;
+    }
+    
+    await group.save();
+    
+    res.json({
+      success: true,
+      message: '组更新成功',
+      data: group
+    });
+  } catch (error) {
+    console.error('更新组错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 删除组API
+router.delete('/team-group/:id', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const group = await TeamGroup.findById(id);
+    if (!group) {
+      return res.status(404).json({ success: false, message: '组不存在' });
+    }
+    
+    // 验证权限
+    if (req.user.role !== 'superadmin' && req.user.id.toString() !== group.teamLeaderId) {
+      return res.status(403).json({ success: false, message: '权限不足' });
+    }
+    
+    // 检查是否有组员
+    const memberCount = await Employee.countDocuments({ teamGroupId: id });
+    if (memberCount > 0) {
+      return res.status(400).json({ success: false, message: '该组下有组员，无法删除' });
+    }
+    
+    // 检查是否有组长
+    if (group.groupLeaderId) {
+      const groupLeader = await Admin.findById(group.groupLeaderId);
+      if (groupLeader) {
+        // 清空组长的组信息
+        groupLeader.teamGroupId = null;
+        groupLeader.groupName = null;
+        await groupLeader.save();
+      }
+    }
+    
+    await group.deleteOne();
+    
+    res.json({
+      success: true,
+      message: '组删除成功'
+    });
+  } catch (error) {
+    console.error('删除组错误:', error);
     res.status(500).json({ success: false, message: '服务器错误' });
   }
 });

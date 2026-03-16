@@ -18,6 +18,18 @@ const adminSchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  teamGroupId: {
+    type: String,
+    default: null
+  },
+  groupName: {
+    type: String,
+    default: null
+  },
+  commission: {
+    type: Number,
+    default: 0
+  },
   realName: {
     type: String,
     default: ''

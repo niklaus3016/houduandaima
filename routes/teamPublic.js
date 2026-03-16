@@ -7,6 +7,7 @@ const LoginRecord = require('../models/LoginRecord');
 const Employee = require('../models/Employee');
 const Admin = require('../models/Admin');
 const UserActivity = require('../models/UserActivity');
+const TeamGroup = require('../models/TeamGroup');
 
 function getBeijingDate() {
   const now = new Date();
@@ -158,10 +159,15 @@ router.get('/list', async (req, res) => {
       else if (totalRevenue >= 50000) level = '王牌';
       else if (totalRevenue >= 10000) level = '精英';
       
+      // 获取团队组数
+      const groups = await TeamGroup.find({ teamLeaderId: admin._id.toString() });
+      const groupCount = groups.length;
+      
       return {
         id: admin._id,
         leader: admin.teamName || admin.realName || admin.username,
         memberCount: employeeIds.length,
+        groupCount: groupCount,
         todayAds,
         monthlyAds,
         totalAds,

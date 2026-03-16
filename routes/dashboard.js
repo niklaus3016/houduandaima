@@ -94,6 +94,24 @@ router.get('/kpi', authMiddleware, async (req, res) => {
         const userGolds = await UserGold.find({ employeeId: { $in: employeeIds } });
         teamMemberUserIds = userGolds.map(ug => ug.userId);
       }
+    } else if (req.user.role !== 'superadmin') {
+      // 非超管，根据角色进行筛选
+      const currentAdmin = await Admin.findById(req.user.id);
+      if (currentAdmin) {
+        if (currentAdmin.teamGroupId) {
+          // 组长：按teamGroupId筛选
+          const employees = await Employee.find({ teamGroupId: currentAdmin.teamGroupId });
+          const employeeIds = employees.map(e => e.employeeId);
+          const userGolds = await UserGold.find({ employeeId: { $in: employeeIds } });
+          teamMemberUserIds = userGolds.map(ug => ug.userId);
+        } else if (currentAdmin.teamName) {
+          // 团队长：按teamName筛选
+          const employees = await Employee.find({ parentId: currentAdmin._id.toString() });
+          const employeeIds = employees.map(e => e.employeeId);
+          const userGolds = await UserGold.find({ employeeId: { $in: employeeIds } });
+          teamMemberUserIds = userGolds.map(ug => ug.userId);
+        }
+      }
     }
     
     if (range === 'yesterday') {
@@ -439,6 +457,32 @@ router.get('/users', authMiddleware, async (req, res) => {
             filteredUserStats[userId] = userStats[userId];
           }
         });
+      }
+    } else if (req.user.role !== 'superadmin') {
+      // 非超管，根据角色进行筛选
+      const currentAdmin = await Admin.findById(req.user.id);
+      if (currentAdmin) {
+        if (currentAdmin.teamGroupId) {
+          // 组长：按teamGroupId筛选
+          const employees = await Employee.find({ teamGroupId: currentAdmin.teamGroupId });
+          const employeeIds = employees.map(e => e.employeeId);
+          filteredUserStats = {};
+          Object.keys(userStats).forEach(userId => {
+            if (employeeIds.includes(userStats[userId].employeeId)) {
+              filteredUserStats[userId] = userStats[userId];
+            }
+          });
+        } else if (currentAdmin.teamName) {
+          // 团队长：按teamName筛选
+          const employees = await Employee.find({ parentId: currentAdmin._id.toString() });
+          const employeeIds = employees.map(e => e.employeeId);
+          filteredUserStats = {};
+          Object.keys(userStats).forEach(userId => {
+            if (employeeIds.includes(userStats[userId].employeeId)) {
+              filteredUserStats[userId] = userStats[userId];
+            }
+          });
+        }
       }
     }
     

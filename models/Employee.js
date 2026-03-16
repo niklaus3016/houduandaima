@@ -23,6 +23,14 @@ const employeeSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  teamGroupId: {
+    type: String,
+    default: null
+  },
+  groupName: {
+    type: String,
+    default: null
+  },
   status: {
     type: String,
     default: 'enabled'

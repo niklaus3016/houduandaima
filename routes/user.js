@@ -1,12 +1,14 @@
 const express = require('express');
 const router = express.Router();
 const UserGold = require('../models/UserGold');
+const UserActivity = require('../models/UserActivity');
 const LoginRecord = require('../models/LoginRecord');
 const DailyTarget = require('../models/DailyTarget');
 const DailyBonusClaim = require('../models/DailyBonusClaim');
 const GoldLog = require('../models/GoldLog');
 const Employee = require('../models/Employee');
 const Team = require('../models/Team');
+const Admin = require('../models/Admin');
 const authMiddleware = require('../middleware/auth');
 
 // 获取北京时间
@@ -324,6 +326,180 @@ router.get('/low-performance', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error('获取低绩效用户错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 获取所有注册用户（包括未上线的新人）
+router.get('/new-users', authMiddleware, async (req, res) => {
+  try {
+    const { days, team, teamGroupId, status } = req.query;
+    
+    // 计算时间范围
+    const daysAgo = parseInt(days) || 15;
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - daysAgo);
+    startDate.setHours(0, 0, 0, 0);
+    
+    // 获取所有用户
+    let users = await UserGold.find({}).sort({ createdAt: -1 });
+    
+    // 获取所有员工信息
+    const employees = await Employee.find({});
+    const employeeMap = {};
+    employees.forEach(emp => {
+      employeeMap[emp.employeeId] = emp;
+    });
+    
+    // 获取所有管理员信息（团队长和组长）
+    const admins = await Admin.find({});
+    const adminMap = {};
+    admins.forEach(admin => {
+      adminMap[admin._id.toString()] = admin;
+    });
+    
+    // 获取用户活动记录
+    const userActivities = await UserActivity.aggregate([
+      {
+        $group: {
+          _id: '$userId',
+          firstActivity: { $min: '$createTime' },
+          lastActivity: { $max: '$createTime' },
+          activityCount: { $sum: 1 }
+        }
+      }
+    ]);
+    
+    const activityMap = {};
+    userActivities.forEach(activity => {
+      activityMap[activity._id] = activity;
+    });
+    
+    // 获取用户登录记录
+    const loginRecords = await LoginRecord.aggregate([
+      {
+        $group: {
+          _id: '$userId',
+          firstLogin: { $min: '$loginDate' },
+          lastLogin: { $max: '$loginDate' },
+          loginDays: { $sum: 1 }
+        }
+      }
+    ]);
+    
+    const loginMap = {};
+    loginRecords.forEach(login => {
+      loginMap[login._id] = login;
+    });
+    
+    // 构建用户列表
+    let newUsers = [];
+    
+    for (const user of users) {
+      const employee = employeeMap[user.employeeId];
+      const activity = activityMap[user.userId];
+      const login = loginMap[user.userId];
+      
+      // 判断注册时间（使用最早的活动时间或登录时间）
+      const registerTime = activity?.firstActivity || login?.firstLogin || user.createdAt || new Date();
+      
+      // 时间范围筛选
+      if (registerTime < startDate) {
+        continue;
+      }
+      
+      // 判断是否上线（有活动记录或登录记录）
+      const isOnline = !!(activity || login);
+      
+      // 状态筛选
+      if (status === 'online' && !isOnline) {
+        continue;
+      }
+      if (status === 'offline' && isOnline) {
+        continue;
+      }
+      
+      // 获取团队和组长信息
+      let teamName = '';
+      let teamLeaderName = '';
+      let groupName = '';
+      let groupLeaderName = '';
+      
+      if (employee) {
+        teamName = employee.teamName || '';
+        groupName = employee.groupName || '';
+        
+        // 获取团队长信息
+        if (employee.parentId) {
+          const teamLeader = adminMap[employee.parentId];
+          if (teamLeader) {
+            teamLeaderName = teamLeader.realName || teamLeader.username;
+          }
+        }
+        
+        // 获取组长信息
+        if (employee.teamGroupId) {
+          const groupLeader = admins.find(a => 
+            a.teamGroupId === employee.teamGroupId && 
+            a.role === 'NORMAL_ADMIN'
+          );
+          if (groupLeader) {
+            groupLeaderName = groupLeader.realName || groupLeader.username;
+          }
+        }
+      }
+      
+      // 团队筛选
+      if (team && team !== teamName) {
+        continue;
+      }
+      
+      // 组筛选
+      if (teamGroupId && employee?.teamGroupId !== teamGroupId) {
+        continue;
+      }
+      
+      // 权限控制：团队长和组长只能看自己的用户
+      if (req.user.role !== 'superadmin') {
+        const currentAdmin = await Admin.findById(req.user.id);
+        if (currentAdmin) {
+          if (currentAdmin.teamGroupId) {
+            // 组长：只能看自己组的用户
+            if (employee?.teamGroupId !== currentAdmin.teamGroupId) {
+              continue;
+            }
+          } else if (currentAdmin.teamName) {
+            // 团队长：只能看自己团队的用户
+            if (teamName !== currentAdmin.teamName) {
+              continue;
+            }
+          }
+        }
+      }
+      
+      newUsers.push({
+        userId: user.userId,
+        employeeId: user.employeeId,
+        registerTime: registerTime,
+        isOnline: isOnline,
+        teamName: teamName,
+        teamLeaderName: teamLeaderName,
+        groupName: groupName,
+        groupLeaderName: groupLeaderName,
+        lastActiveTime: activity?.lastActivity || login?.lastLogin || null,
+        activityCount: activity?.activityCount || 0,
+        loginDays: login?.loginDays || 0,
+        currentMonthGold: user.currentMonthGold || 0
+      });
+    }
+    
+    res.json({
+      success: true,
+      data: newUsers,
+      total: newUsers.length
+    });
+  } catch (error) {
+    console.error('获取新用户列表错误:', error);
     res.status(500).json({ success: false, message: '服务器错误' });
   }
 });

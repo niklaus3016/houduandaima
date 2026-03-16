@@ -390,6 +390,48 @@ router.put('/group-leader/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// 删除组长API
+router.delete('/group-leader/:id', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const groupLeader = await Admin.findById(id);
+    if (!groupLeader) {
+      return res.status(404).json({ success: false, message: '组长不存在' });
+    }
+    
+    // 验证权限
+    if (req.user.role !== 'superadmin') {
+      // 团队长只能删除自己团队的组长
+      const teamLeader = await Admin.findById(req.user.id);
+      if (teamLeader && teamLeader.teamName !== groupLeader.teamName) {
+        return res.status(403).json({ success: false, message: '权限不足' });
+      }
+    }
+    
+    // 清空TeamGroup表中的组长信息
+    if (groupLeader.teamGroupId) {
+      const group = await TeamGroup.findById(groupLeader.teamGroupId);
+      if (group) {
+        group.groupLeaderId = null;
+        group.groupLeaderName = null;
+        await group.save();
+      }
+    }
+    
+    // 删除组长账号
+    await Admin.findByIdAndDelete(id);
+    
+    res.json({
+      success: true,
+      message: '组长删除成功'
+    });
+  } catch (error) {
+    console.error('删除组长错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
 // 编辑组API
 router.put('/team-group/:id', authMiddleware, async (req, res) => {
   try {

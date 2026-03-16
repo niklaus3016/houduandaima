@@ -23,7 +23,7 @@ const teamGroupSchema = new mongoose.Schema({
   },
   commission: {
     type: Number,
-    default: 0.1
+    default: 0.05
   },
   memberCount: {
     type: Number,

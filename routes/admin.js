@@ -167,7 +167,7 @@ router.post('/team-group/add', authMiddleware, async (req, res) => {
       groupName,
       groupLeaderId: groupLeaderId || null,
       groupLeaderName: groupLeaderName || null,
-      commission: commission || 0.1,
+      commission: commission || 0.05,
       memberCount: 0
     });
     
@@ -252,7 +252,7 @@ router.post('/group-leader/add', authMiddleware, async (req, res) => {
       teamName,
       teamGroupId,
       groupName,
-      commission: commission || 0.1,
+      commission: commission || 0.05,
       realName
     });
     

@@ -313,7 +313,7 @@ router.get('/group-leader/list', authMiddleware, async (req, res) => {
 router.put('/group-leader/:id', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-    const { username, password, realName, teamName, teamGroupId, groupName, commission, status } = req.body;
+    const { username, password, realName, teamName, teamGroupId, groupName, commission, status, phone, region } = req.body;
     
     const groupLeader = await Admin.findById(id);
     if (!groupLeader) {
@@ -350,6 +350,8 @@ router.put('/group-leader/:id', authMiddleware, async (req, res) => {
     if (groupName !== undefined) groupLeader.groupName = groupName;
     if (commission !== undefined) groupLeader.commission = commission;
     if (status !== undefined) groupLeader.status = status;
+    if (phone !== undefined) groupLeader.phone = phone;
+    if (region !== undefined) groupLeader.region = region;
     
     groupLeader.updatedAt = new Date();
     await groupLeader.save();
@@ -376,6 +378,8 @@ router.put('/group-leader/:id', authMiddleware, async (req, res) => {
         groupName: groupLeader.groupName,
         commission: groupLeader.commission,
         realName: groupLeader.realName,
+        phone: groupLeader.phone || '',
+        region: groupLeader.region || '',
         status: groupLeader.status,
         createdAt: groupLeader.createdAt
       }

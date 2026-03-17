@@ -149,7 +149,7 @@ router.get('/list', authMiddleware, async (req, res) => {
 router.put('/:id', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-    const { parentId, realName, phone, region, employeeId } = req.body;
+    const { parentId, realName, phone, region, employeeId, teamGroupId, groupName, groupId } = req.body;
     
     const employee = await Employee.findById(id);
     if (!employee) {
@@ -173,6 +173,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
     if (phone !== undefined) employee.phone = phone;
     if (region !== undefined) employee.region = region;
     if (teamGroupId !== undefined) employee.teamGroupId = teamGroupId;
+    if (groupId !== undefined) employee.teamGroupId = groupId; // 兼容前端传递的groupId
     if (groupName !== undefined) employee.groupName = groupName;
     if (req.body.phoneCount !== undefined) employee.phoneCount = req.body.phoneCount;
     
@@ -189,6 +190,8 @@ router.put('/:id', authMiddleware, async (req, res) => {
         phone: employee.phone,
         region: employee.region,
         employeeId: employee.employeeId,
+        teamGroupId: employee.teamGroupId,
+        groupName: employee.groupName,
         phoneCount: employee.phoneCount || 0
       }
     });

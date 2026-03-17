@@ -551,7 +551,9 @@ router.get('/users', authMiddleware, async (req, res) => {
         regDays,
         superior,
         ipCount,
-        deviceCount
+        deviceCount,
+        groupName: employee.groupName || null,
+        teamGroupId: employee.teamGroupId || null
       };
     });
     

@@ -3,6 +3,7 @@ const router = express.Router();
 const Admin = require('../models/Admin');
 const TeamGroup = require('../models/TeamGroup');
 const Employee = require('../models/Employee');
+const CommissionHistory = require('../models/CommissionHistory');
 const { generateToken, hashPassword, comparePassword } = require('../utils/auth');
 const authMiddleware = require('../middleware/auth');
 
@@ -490,6 +491,21 @@ router.put('/team-group/:id', authMiddleware, async (req, res) => {
       if (commission > 0.2) {
         return res.status(400).json({ success: false, message: '组长分成比例不得超过20%' });
       }
+      
+      // 记录提成比例变更历史
+      if (commission !== group.commission) {
+        const operator = await Admin.findById(req.user.id);
+        const historyRecord = new CommissionHistory({
+          teamGroupId: group._id,
+          groupName: group.groupName,
+          oldCommission: group.commission,
+          newCommission: commission,
+          operatorId: req.user.id,
+          operatorName: operator ? (operator.realName || operator.username) : '未知'
+        });
+        await historyRecord.save();
+      }
+      
       group.commission = commission;
     }
     
@@ -546,6 +562,129 @@ router.delete('/team-group/:id', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error('删除组错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 获取提成比例变更历史
+router.get('/commission-history/:teamGroupId', authMiddleware, async (req, res) => {
+  try {
+    const { teamGroupId } = req.params;
+    
+    const history = await CommissionHistory.find({ teamGroupId })
+      .sort({ changeTime: -1 })
+      .limit(100);
+    
+    res.json({
+      success: true,
+      data: history
+    });
+  } catch (error) {
+    console.error('获取提成比例变更历史错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 获取组长提成记录
+router.get('/group-leader-commission/:teamGroupId', authMiddleware, async (req, res) => {
+  try {
+    const { teamGroupId } = req.params;
+    const { startDate, endDate, limit = 10 } = req.query;
+    const GoldLog = require('../models/GoldLog');
+    const UserGold = require('../models/UserGold');
+    
+    // 获取组信息
+    const group = await TeamGroup.findById(teamGroupId);
+    if (!group) {
+      return res.status(404).json({ success: false, message: '组不存在' });
+    }
+    
+    // 获取组下所有组员
+    const employees = await Employee.find({ teamGroupId });
+    const employeeIds = employees.map(e => e.employeeId);
+    
+    // 获取提成比例变更历史
+    const commissionHistory = await CommissionHistory.find({ teamGroupId })
+      .sort({ changeTime: 1 });
+    
+    // 构建时间范围
+    let queryStartDate = startDate ? new Date(startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    let queryEndDate = endDate ? new Date(endDate) : new Date();
+    
+    // 获取金币记录
+    const goldLogs = await GoldLog.find({
+      employeeId: { $in: employeeIds },
+      createTime: { $gte: queryStartDate, $lte: queryEndDate }
+    }).sort({ createTime: -1 });
+    
+    // 计算每条记录的提成
+    const commissionRecords = goldLogs.map(log => {
+      // 找到当时的提成比例
+      let commission = group.commission; // 默认使用当前比例
+      for (let i = commissionHistory.length - 1; i >= 0; i--) {
+        if (log.createTime >= commissionHistory[i].changeTime) {
+          commission = commissionHistory[i].newCommission;
+          break;
+        }
+      }
+      if (commissionHistory.length === 0 || log.createTime < commissionHistory[0].changeTime) {
+        // 如果没有变更历史，或者记录在第一次变更之前，使用当前比例
+        commission = group.commission;
+      }
+      
+      const employee = employees.find(e => e.employeeId === log.employeeId);
+      const beijingTime = new Date(log.createTime.getTime() + 8 * 60 * 60 * 1000);
+      
+      return {
+        date: beijingTime.toISOString().split('T')[0],
+        time: beijingTime.toISOString().split('T')[1].split('.')[0],
+        employeeId: log.employeeId,
+        employeeName: employee ? employee.realName : '未知',
+        gold: log.gold,
+        earnings: parseFloat((log.gold / 1000).toFixed(4)),
+        commission: commission,
+        commissionAmount: parseFloat((log.gold / 1000 * commission).toFixed(4))
+      };
+    });
+    
+    // 按日期分组统计
+    const dailyStats = {};
+    commissionRecords.forEach(record => {
+      if (!dailyStats[record.date]) {
+        dailyStats[record.date] = {
+          date: record.date,
+          totalEarnings: 0,
+          totalCommission: 0,
+          records: []
+        };
+      }
+      dailyStats[record.date].totalEarnings += record.earnings;
+      dailyStats[record.date].totalCommission += record.commissionAmount;
+      dailyStats[record.date].records.push(record);
+    });
+    
+    // 转换为数组并排序
+    const dailyStatsArray = Object.values(dailyStats)
+      .sort((a, b) => new Date(b.date) - new Date(a.date))
+      .slice(0, parseInt(limit));
+    
+    // 计算总计
+    const totalEarnings = commissionRecords.reduce((sum, r) => sum + r.earnings, 0);
+    const totalCommission = commissionRecords.reduce((sum, r) => sum + r.commissionAmount, 0);
+    
+    res.json({
+      success: true,
+      data: {
+        groupName: group.groupName,
+        currentCommission: group.commission,
+        totalEarnings: parseFloat(totalEarnings.toFixed(4)),
+        totalCommission: parseFloat(totalCommission.toFixed(4)),
+        dailyStats: dailyStatsArray,
+        commissionHistory: commissionHistory
+      }
+    });
+  } catch (error) {
+    console.error('获取组长提成记录错误:', error);
     res.status(500).json({ success: false, message: '服务器错误' });
   }
 });

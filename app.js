@@ -22,6 +22,7 @@ const withdrawAdminRoutes = require('./routes/withdrawAdmin');
 const teamPublicRoutes = require('./routes/teamPublic');
 const newuserPublicRoutes = require('./routes/newuserPublic');
 const healthRoutes = require('./routes/health');
+const groupRoutes = require('./routes/group');
 
 const app = express();
 const PORT = process.env.PORT || 3003;
@@ -55,6 +56,7 @@ app.use('/api/admin/withdraw', withdrawAdminRoutes);
 app.use('/api/team', teamPublicRoutes);
 app.use('/api/newuser', newuserPublicRoutes);
 app.use('/api/health', healthRoutes);
+app.use('/api/group', groupRoutes);
 
 // 连接MongoDB
 mongoose.connect(MONGODB_URI)

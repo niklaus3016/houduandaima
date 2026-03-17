@@ -401,12 +401,41 @@ router.get('/users', authMiddleware, async (req, res) => {
       endDate = new Date();
     }
     
+    // 获取所有员工信息
+    const allEmployees = await Employee.find({});
+    const employeeMap = {};
+    allEmployees.forEach(emp => {
+      employeeMap[emp.employeeId] = emp;
+    });
+    
+    // 获取所有UserGold记录
+    const userGolds = await UserGold.find({});
+    const userGoldMap = {};
+    userGolds.forEach(ug => {
+      userGoldMap[ug.employeeId] = ug;
+    });
+    
+    // 构建初始用户统计（包含所有员工）
+    const userStats = {};
+    allEmployees.forEach(emp => {
+      const userGold = userGoldMap[emp.employeeId];
+      if (userGold) {
+        userStats[userGold.userId] = {
+          userId: userGold.userId,
+          employeeId: emp.employeeId,
+          watched: 0,
+          earnings: 0,
+          totalEcpm: 0
+        };
+      }
+    });
+    
+    // 从GoldLog中获取金币记录
     const goldLogs = await GoldLog.find({ 
       createTime: { $gte: startDate, $lt: endDate } 
     });
     
-    const userStats = {};
-    
+    // 更新有金币记录的用户统计
     goldLogs.forEach(log => {
       if (!userStats[log.userId]) {
         userStats[log.userId] = {
@@ -424,13 +453,8 @@ router.get('/users', authMiddleware, async (req, res) => {
     });
     
     const employeeIds = [...new Set(Object.values(userStats).map(s => s.employeeId))];
-    const employees = await Employee.find({ employeeId: { $in: employeeIds } });
-    const employeeMap = {};
-    employees.forEach(emp => {
-      employeeMap[emp.employeeId] = emp;
-    });
     
-    const parentIds = [...new Set(employees.map(e => e.parentId).filter(id => id))];
+    const parentIds = [...new Set(allEmployees.map(e => e.parentId).filter(id => id))];
     const admins = await Admin.find({ _id: { $in: parentIds } });
     const adminMap = {};
     admins.forEach(admin => {

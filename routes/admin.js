@@ -607,7 +607,7 @@ router.get('/commission-history/:teamGroupId', authMiddleware, async (req, res) 
 router.get('/group-leader-commission/:teamGroupId', authMiddleware, async (req, res) => {
   try {
     const { teamGroupId } = req.params;
-    const { startDate, endDate, limit = 10 } = req.query;
+    const { startDate, endDate, range, limit = 10 } = req.query;
     const GoldLog = require('../models/GoldLog');
     const UserGold = require('../models/UserGold');
     
@@ -626,8 +626,49 @@ router.get('/group-leader-commission/:teamGroupId', authMiddleware, async (req, 
       .sort({ changeTime: 1 });
     
     // 构建时间范围
-    let queryStartDate = startDate ? new Date(startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    let queryEndDate = endDate ? new Date(endDate) : new Date();
+    let queryStartDate, queryEndDate;
+    const now = new Date();
+    const beijingNow = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+    
+    if (range) {
+      const todayStart = new Date(beijingNow);
+      todayStart.setHours(0, 0, 0, 0);
+      const todayEnd = new Date(beijingNow);
+      todayEnd.setHours(23, 59, 59, 999);
+      
+      switch (range) {
+        case 'today':
+          queryStartDate = new Date(todayStart.getTime() - 8 * 60 * 60 * 1000);
+          queryEndDate = new Date(todayEnd.getTime() - 8 * 60 * 60 * 1000);
+          break;
+        case 'yesterday':
+          const yesterdayStart = new Date(todayStart);
+          yesterdayStart.setDate(yesterdayStart.getDate() - 1);
+          const yesterdayEnd = new Date(todayEnd);
+          yesterdayEnd.setDate(yesterdayEnd.getDate() - 1);
+          queryStartDate = new Date(yesterdayStart.getTime() - 8 * 60 * 60 * 1000);
+          queryEndDate = new Date(yesterdayEnd.getTime() - 8 * 60 * 60 * 1000);
+          break;
+        case 'this_week':
+          const weekStart = new Date(todayStart);
+          weekStart.setDate(weekStart.getDate() - weekStart.getDay());
+          queryStartDate = new Date(weekStart.getTime() - 8 * 60 * 60 * 1000);
+          queryEndDate = new Date(todayEnd.getTime() - 8 * 60 * 60 * 1000);
+          break;
+        case 'this_month':
+          const monthStart = new Date(todayStart);
+          monthStart.setDate(1);
+          queryStartDate = new Date(monthStart.getTime() - 8 * 60 * 60 * 1000);
+          queryEndDate = new Date(todayEnd.getTime() - 8 * 60 * 60 * 1000);
+          break;
+        default:
+          queryStartDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+          queryEndDate = new Date();
+      }
+    } else {
+      queryStartDate = startDate ? new Date(startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+      queryEndDate = endDate ? new Date(endDate) : new Date();
+    }
     
     // 获取金币记录
     const goldLogs = await GoldLog.find({

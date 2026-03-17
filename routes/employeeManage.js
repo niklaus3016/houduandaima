@@ -59,6 +59,16 @@ router.post('/create', authMiddleware, async (req, res) => {
     
     await newEmployee.save();
     
+    // 自动创建UserGold记录，确保新员工出现在统计接口中
+    const userId = `user_${employeeId}_${Date.now()}`;
+    const newUserGold = new UserGold({
+      userId,
+      employeeId,
+      currentMonthGold: 0,
+      lastMonthGold: 0
+    });
+    await newUserGold.save();
+    
     res.json({
       success: true,
       message: '创建成功',
@@ -72,7 +82,8 @@ router.post('/create', authMiddleware, async (req, res) => {
         role: newEmployee.role,
         status: newEmployee.status,
         teamGroupId: newEmployee.teamGroupId,
-        groupName: newEmployee.groupName
+        groupName: newEmployee.groupName,
+        userId: userId // 返回生成的userId
       }
     });
   } catch (error) {

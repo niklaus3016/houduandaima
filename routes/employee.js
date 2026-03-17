@@ -99,7 +99,24 @@ router.post('/add', async (req, res) => {
     
     await newEmployee.save();
     
-    res.json({ success: true, message: '员工添加成功', data: newEmployee });
+    // 自动创建UserGold记录，确保新员工出现在统计接口中
+    const userId = `user_${employeeId}_${Date.now()}`;
+    const newUserGold = new UserGold({
+      userId,
+      employeeId,
+      currentMonthGold: 0,
+      lastMonthGold: 0
+    });
+    await newUserGold.save();
+    
+    res.json({ 
+      success: true, 
+      message: '员工添加成功', 
+      data: {
+        ...newEmployee.toObject(),
+        userId: userId
+      }
+    });
   } catch (error) {
     console.error('添加员工错误:', error);
     res.status(500).json({ success: false, message: '服务器错误' });

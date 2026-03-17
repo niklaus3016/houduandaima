@@ -341,15 +341,32 @@ router.get('/new-users', authMiddleware, async (req, res) => {
     startDate.setDate(startDate.getDate() - daysAgo);
     startDate.setHours(0, 0, 0, 0);
     
-    // 获取所有用户
-    let users = await UserGold.find({}).sort({ createdAt: -1 });
-    
     // 获取所有员工信息
     const employees = await Employee.find({});
     const employeeMap = {};
     employees.forEach(emp => {
       employeeMap[emp.employeeId] = emp;
     });
+    
+    // 获取所有用户
+    let users = await UserGold.find({}).sort({ createdAt: -1 });
+    
+    // 从员工列表中创建缺失的用户记录（确保所有员工都有UserGold记录）
+    for (const employee of employees) {
+      const existingUser = users.find(u => u.employeeId === employee.employeeId);
+      if (!existingUser) {
+        // 创建新的UserGold记录
+        const userId = `user_${employee.employeeId}_${Date.now()}`;
+        const newUser = new UserGold({
+          userId,
+          employeeId: employee.employeeId,
+          currentMonthGold: 0,
+          lastMonthGold: 0
+        });
+        await newUser.save();
+        users.push(newUser);
+      }
+    }
     
     // 获取所有管理员信息（团队长和组长）
     const admins = await Admin.find({});

@@ -375,11 +375,29 @@ router.put('/group-leader/:id', authMiddleware, async (req, res) => {
     await groupLeader.save();
     
     // 如果更新了组信息，同步更新TeamGroup表
-    if (teamGroupId || groupName || realName) {
+    if (teamGroupId || groupName || realName || commission !== undefined) {
       const group = await TeamGroup.findOne({ groupLeaderId: id });
       if (group) {
         if (groupName) group.groupName = groupName;
         if (realName) group.groupLeaderName = realName;
+        
+        // 同步更新提成比例并记录变更历史
+        if (commission !== undefined && commission !== group.commission) {
+          // 记录提成比例变更历史
+          const operator = await Admin.findById(req.user.id);
+          const historyRecord = new CommissionHistory({
+            teamGroupId: group._id,
+            groupName: group.groupName,
+            oldCommission: group.commission,
+            newCommission: commission,
+            operatorId: req.user.id,
+            operatorName: operator ? (operator.realName || operator.username) : '未知'
+          });
+          await historyRecord.save();
+          
+          group.commission = commission;
+        }
+        
         await group.save();
       }
     }

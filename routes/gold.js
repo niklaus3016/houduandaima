@@ -167,21 +167,40 @@ router.get('/today-stats', async (req, res) => {
     todayBeijing.setHours(0, 0, 0, 0);
     const todayStart = new Date(todayBeijing.getTime() - 8 * 60 * 60 * 1000);
     
+    // 获取北京时间昨日开始
+    const yesterdayBeijing = new Date(beijingNow);
+    yesterdayBeijing.setUTCDate(yesterdayBeijing.getUTCDate() - 1);
+    yesterdayBeijing.setHours(0, 0, 0, 0);
+    const yesterdayStart = new Date(yesterdayBeijing.getTime() - 8 * 60 * 60 * 1000);
+    
+    // 获取北京时间今日结束（昨日结束）
+    const todayEndBeijing = new Date(beijingNow);
+    todayEndBeijing.setHours(0, 0, 0, 0);
+    const yesterdayEnd = new Date(todayEndBeijing.getTime() - 8 * 60 * 60 * 1000);
+    
     // 查询今日所有设备的金币记录（北京时间）
-    const logs = await GoldLog.find({
+    const todayLogs = await GoldLog.find({
       userId,
       createTime: { $gte: todayStart }
     });
     
+    // 查询昨日所有设备的金币记录（北京时间）
+    const yesterdayLogs = await GoldLog.find({
+      userId,
+      createTime: { $gte: yesterdayStart, $lt: yesterdayEnd }
+    });
+    
     // 统计金币总数和记录数
-    const todayCoins = logs.reduce((sum, log) => sum + (log.gold || 0), 0);
-    const todayRecordCount = logs.length;
+    const todayCoins = todayLogs.reduce((sum, log) => sum + (log.gold || 0), 0);
+    const todayRecordCount = todayLogs.length;
+    const yesterdayRecordCount = yesterdayLogs.length;
     
     res.json({
       success: true,
       data: {
         todayCoins,
-        todayRecordCount
+        todayRecordCount,
+        yesterdayRecordCount
       }
     });
   } catch (error) {

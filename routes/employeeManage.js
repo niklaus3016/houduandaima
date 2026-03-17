@@ -21,7 +21,7 @@ function generateEmployeeId() {
 // 创建员工账号
 router.post('/create', authMiddleware, async (req, res) => {
   try {
-    const { parentId, realName, phone, region, teamGroupId, groupName } = req.body;
+    const { parentId, realName, phone, region, teamGroupId, groupName, groupId } = req.body;
     
     if (!realName) {
       return res.status(400).json({ success: false, message: '请填写员工姓名' });
@@ -51,7 +51,7 @@ router.post('/create', authMiddleware, async (req, res) => {
       phone: phone || '',
       region: region || '',
       phoneCount: 0,
-      teamGroupId: teamGroupId || null,
+      teamGroupId: teamGroupId || groupId || null, // 兼容前端传递的groupId
       groupName: groupName || null,
       status: 'enabled',
       role: 'EMPLOYEE'

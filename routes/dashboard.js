@@ -482,7 +482,7 @@ router.get('/users', authMiddleware, async (req, res) => {
           }
         });
       }
-    } else if (req.user.role !== 'superadmin') {
+    } else if (req.user && req.user.role !== 'superadmin') {
       // 非超管，根据角色进行筛选
       const currentAdmin = await Admin.findById(req.user.id);
       if (currentAdmin) {

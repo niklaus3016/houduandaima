@@ -290,30 +290,19 @@ router.get('/kpi', authMiddleware, async (req, res) => {
       ? ((totalClicks - Math.floor(prev.count * 0.15)) / Math.floor(prev.count * 0.15) * 100).toFixed(1) 
       : 0;
     
-    // 今日活跃用户（北京时间）
-    const todayStartBeijing = new Date(beijingNow);
-    todayStartBeijing.setUTCHours(0, 0, 0, 0);
-    const todayStart = new Date(todayStartBeijing.getTime() - 8 * 60 * 60 * 1000);
-    const todayEnd = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
-    
-    const todayLoginRecords = await LoginRecord.find({
-      loginDate: { $gte: todayStart, $lt: todayEnd },
+    // 活跃用户数计算
+    const currentLoginRecords = await LoginRecord.find({
+      loginDate: { $gte: startDate, $lt: endDate },
       ...(teamMemberUserIds ? { employeeId: { $in: teamMemberUserIds } } : {})
     });
-    const activeUsers = new Set(todayLoginRecords.map(r => r.employeeId)).size;
+    const activeUsers = new Set(currentLoginRecords.map(r => r.employeeId)).size;
     
-    // 昨日活跃用户
-    const yesterdayBeijing = new Date(beijingNow);
-    yesterdayBeijing.setUTCDate(yesterdayBeijing.getUTCDate() - 1);
-    yesterdayBeijing.setUTCHours(0, 0, 0, 0);
-    const yesterdayStart = new Date(yesterdayBeijing.getTime() - 8 * 60 * 60 * 1000);
-    const yesterdayEnd = todayStart;
-    
-    const yesterdayLoginRecords = await LoginRecord.find({
-      loginDate: { $gte: yesterdayStart, $lt: yesterdayEnd },
+    // 对比时间范围的活跃用户数
+    const prevLoginRecords = await LoginRecord.find({
+      loginDate: { $gte: prevStartDate, $lt: prevEndDate },
       ...(teamMemberUserIds ? { employeeId: { $in: teamMemberUserIds } } : {})
     });
-    const prevActiveUsers = new Set(yesterdayLoginRecords.map(r => r.employeeId)).size;
+    const prevActiveUsers = new Set(prevLoginRecords.map(r => r.employeeId)).size;
     
     const activeUsersGrowth = prevActiveUsers > 0 
       ? ((activeUsers - prevActiveUsers) / prevActiveUsers * 100).toFixed(1) 

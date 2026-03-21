@@ -38,6 +38,7 @@ function getBeijingDateString() {
 router.get('/list', authMiddleware, async (req, res) => {
   try {
     const { page = 1, pageSize = 10 } = req.query;
+    const { username } = req.user;
     
     const todayStart = getBeijingStartOfDay();
     const todayEnd = getBeijingEndOfDay();
@@ -45,24 +46,39 @@ router.get('/list', authMiddleware, async (req, res) => {
     // 查询注册天数 <= 15 的员工
     const fifteenDaysAgo = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000);
     
-    const total = await Employee.countDocuments({ 
-      createdAt: { $gte: fifteenDaysAgo },
-      $or: [{ status: 'enabled' }, { status: 1 }, { status: { $exists: false } }]
-    });
+    // 获取当前管理员信息
+    const currentAdmin = await Admin.findOne({ username });
     
-    const employees = await Employee.find({ 
+    // 构建查询条件
+    const query = {
       createdAt: { $gte: fifteenDaysAgo },
       $or: [{ status: 'enabled' }, { status: 1 }, { status: { $exists: false } }]
-    })
+    };
+    
+    // 如果不是系统管理员，只显示自己团队的新人
+    if (currentAdmin && currentAdmin.role !== 'SUPER_ADMIN') {
+      // 查找所有parentId为当前管理员的员工
+      query.parentId = currentAdmin._id;
+    }
+    
+    const total = await Employee.countDocuments(query);
+    
+    const employees = await Employee.find(query)
       .skip((page - 1) * pageSize)
       .limit(parseInt(pageSize))
       .sort({ createdAt: -1 });
     
     // 今日新注册用户数
-    const todayNewUsers = await Employee.countDocuments({ 
+    const todayQuery = {
       createdAt: { $gte: todayStart, $lte: todayEnd },
       $or: [{ status: 'enabled' }, { status: 1 }, { status: { $exists: false } }]
-    });
+    };
+    
+    if (currentAdmin && currentAdmin.role !== 'SUPER_ADMIN') {
+      todayQuery.parentId = currentAdmin._id;
+    }
+    
+    const todayNewUsers = await Employee.countDocuments(todayQuery);
     
     // 获取所有员工号
     const employeeIds = employees.map(e => e.employeeId);
@@ -140,16 +156,23 @@ router.get('/list', authMiddleware, async (req, res) => {
       };
     }));
     
+    // 过滤数据：如果不是系统管理员，只显示superior匹配的新人
+    let filteredUsers = usersWithDetails;
+    if (currentAdmin && currentAdmin.role !== 'SUPER_ADMIN') {
+      // 获取当前管理员的显示名称（teamName或realName或username）
+      const currentAdminName = currentAdmin.teamName || currentAdmin.realName || currentAdmin.username;
+      // 过滤出superior匹配的员工
+      filteredUsers = usersWithDetails.filter(user => user.superior === currentAdminName);
+    }
+    
     res.json({
       success: true,
-      data: {
-        list: usersWithDetails,
-        todayNewUsers: todayNewUsers,
-        pagination: {
-          total,
-          page: parseInt(page),
-          pageSize: parseInt(pageSize)
-        }
+      todayNewUsers: todayNewUsers,
+      list: filteredUsers,
+      pagination: {
+        total: filteredUsers.length,
+        page: parseInt(page),
+        pageSize: parseInt(pageSize)
       }
     });
   } catch (error) {

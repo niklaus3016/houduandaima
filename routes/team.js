@@ -224,23 +224,42 @@ router.get('/members', authMiddleware, async (req, res) => {
     
     const beijingNow = getBeijingDate();
     const todayStart = getBeijingStartOfDay(beijingNow);
+    const monthStart = getBeijingStartOfMonth();
     
     const memberDetails = await Promise.all(members.map(async (member) => {
-      const goldLogs = await GoldLog.find({ userId: member.userId });
       const todayGoldLogs = await GoldLog.find({
         userId: member.userId,
         createTime: { $gte: todayStart }
       });
       
-      const todayRevenue = todayGoldLogs.reduce((sum, log) => sum + log.gold, 0);
-      const totalRevenue = goldLogs.reduce((sum, log) => sum + log.gold, 0);
+      const monthGoldLogs = await GoldLog.find({
+        userId: member.userId,
+        createTime: { $gte: monthStart }
+      });
+      
+      const allGoldLogs = await GoldLog.find({ userId: member.userId });
+      
+      const todayWatched = todayGoldLogs.length;
+      const monthlyWatched = monthGoldLogs.length;
+      
+      const todayEarnings = todayGoldLogs.reduce((sum, log) => sum + log.gold, 0) / 1000;
+      const monthlyEarnings = monthGoldLogs.reduce((sum, log) => sum + log.gold, 0) / 1000;
+      const totalEarnings = allGoldLogs.reduce((sum, log) => sum + log.gold, 0) / 1000;
+      
+      const todayAgc = todayGoldLogs.reduce((sum, log) => sum + log.gold, 0);
+      const monthlyAgc = monthGoldLogs.reduce((sum, log) => sum + log.gold, 0);
       
       return {
-        ...member.toObject ? member.toObject() : member,
+        id: member.userId,
+        userId: member.userId,
         username: `用户${member.userId}`,
-        todayRevenue: parseFloat(todayRevenue.toFixed(2)),
-        totalRevenue: parseFloat(totalRevenue.toFixed(2)),
-        performance: parseFloat((Math.random() * 100).toFixed(2))
+        todayWatched,
+        monthlyWatched,
+        todayEarnings: parseFloat(todayEarnings.toFixed(2)),
+        monthlyEarnings: parseFloat(monthlyEarnings.toFixed(2)),
+        totalEarnings: parseFloat(totalEarnings.toFixed(2)),
+        todayAgc: parseFloat(todayAgc.toFixed(2)),
+        monthlyAgc: parseFloat(monthlyAgc.toFixed(2))
       };
     }));
     

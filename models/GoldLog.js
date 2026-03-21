@@ -25,6 +25,10 @@ const goldLogSchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  commissionRate: {
+    type: Number,
+    default: 0
+  },
   createTime: {
     type: Date,
     default: Date.now

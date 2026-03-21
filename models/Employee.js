@@ -43,6 +43,10 @@ const employeeSchema = new mongoose.Schema({
     type: String,
     default: 'EMPLOYEE'
   },
+  joinedGroupAt: {
+    type: Date,
+    default: Date.now
+  },
   createdAt: {
     type: Date,
     default: Date.now

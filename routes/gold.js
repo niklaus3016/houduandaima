@@ -22,8 +22,16 @@ router.post('/reward', async (req, res) => {
     }
     
     // 获取分成比例（默认50%）
-    const config = await SystemConfig.findOne({ key: 'commissionRate' });
-    const commissionRate = config ? config.value : 0.5;
+    let commissionRate = 0.5;
+    try {
+      const config = await SystemConfig.findOne({ key: 'commissionRate' });
+      if (config) {
+        commissionRate = config.value;
+      }
+    } catch (err) {
+      console.error('查询系统配置错误:', err);
+      // 即使查询失败，也使用默认值
+    }
     
     // 计算金币（ECPM * 分成比例）
     const gold = ecpm * commissionRate;
@@ -47,6 +55,25 @@ router.post('/reward', async (req, res) => {
     await userGold.save();
     
     // 记录金币日志（使用当前UTC时间，但确保在查询时正确处理）
+    let groupCommissionRate = 0;
+    
+    // 尝试查询员工所在组的提成比例
+    try {
+      const Employee = require('../models/Employee');
+      const TeamGroup = require('../models/TeamGroup');
+      
+      const employee = await Employee.findOne({ employeeId });
+      if (employee && employee.teamGroupId) {
+        const group = await TeamGroup.findById(employee.teamGroupId);
+        if (group) {
+          groupCommissionRate = group.commission;
+        }
+      }
+    } catch (err) {
+      console.error('查询员工和组信息错误:', err);
+      // 即使查询失败，也继续发放金币
+    }
+    
     const goldLog = new GoldLog({
       userId,
       employeeId,
@@ -54,6 +81,7 @@ router.post('/reward', async (req, res) => {
       ecpm,
       gold,
       slotId: slotId || '',
+      commissionRate: groupCommissionRate,
       createTime: new Date()
     });
     
@@ -69,17 +97,30 @@ router.post('/reward', async (req, res) => {
 // 获取金币记录
 router.get('/log', async (req, res) => {
   try {
-    const { userId, deviceId, limit = 200 } = req.query;
+    const { userId, deviceId, employeeId, limit = 200 } = req.query;
     
-    if (!userId || !deviceId) {
-      return res.status(400).json({ success: false, message: '缺少userId或deviceId参数' });
+    // 构建查询条件
+    const query = {};
+    if (userId) {
+      query.userId = userId;
+    }
+    if (deviceId) {
+      query.deviceId = deviceId;
+    }
+    if (employeeId) {
+      query.employeeId = employeeId;
+    }
+    
+    // 如果没有提供任何查询参数，返回错误
+    if (Object.keys(query).length === 0) {
+      return res.status(400).json({ success: false, message: '缺少userId、deviceId或employeeId参数' });
     }
     
     // 确保limit是有效的数字，最大限制为10000
     const limitNum = Math.min(parseInt(limit) || 200, 10000);
     
     // 获取金币记录，支持自定义 limit 参数
-    const goldLogs = await GoldLog.find({ userId, deviceId })
+    const goldLogs = await GoldLog.find(query)
       .sort({ createTime: -1 })
       .limit(limitNum);
     

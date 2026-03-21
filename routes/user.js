@@ -351,11 +351,23 @@ router.get('/new-users', authMiddleware, async (req, res) => {
     // 获取所有用户
     let users = await UserGold.find({}).sort({ createdAt: -1 });
     
-    // 从员工列表中创建缺失的用户记录（确保所有员工都有UserGold记录）
+    // 构建员工ID到用户的映射，确保每个员工号只保留最新的一条记录
+    const employeeUserMap = {};
+    users.forEach(user => {
+      const employeeId = user.employeeId;
+      if (!employeeUserMap[employeeId] || 
+          new Date(user.createdAt) > new Date(employeeUserMap[employeeId].createdAt)) {
+        employeeUserMap[employeeId] = user;
+      }
+    });
+    
+    // 只保留Employee表中存在的用户
+    const filteredUsers = [];
     for (const employee of employees) {
-      const existingUser = users.find(u => u.employeeId === employee.employeeId);
-      if (!existingUser) {
-        // 创建新的UserGold记录
+      if (employeeUserMap[employee.employeeId]) {
+        filteredUsers.push(employeeUserMap[employee.employeeId]);
+      } else {
+        // 创建新的UserGold记录（确保所有员工都有UserGold记录）
         const userId = `user_${employee.employeeId}_${Date.now()}`;
         const newUser = new UserGold({
           userId,
@@ -364,9 +376,12 @@ router.get('/new-users', authMiddleware, async (req, res) => {
           lastMonthGold: 0
         });
         await newUser.save();
-        users.push(newUser);
+        filteredUsers.push(newUser);
       }
     }
+    
+    // 使用过滤后的用户列表
+    users = filteredUsers;
     
     // 获取所有管理员信息（团队长和组长）
     const admins = await Admin.find({});
@@ -409,24 +424,54 @@ router.get('/new-users', authMiddleware, async (req, res) => {
       loginMap[login._id] = login;
     });
     
+    // 获取用户金币记录（按最后一条金币记录算活跃时间）
+    const goldLogs = await GoldLog.aggregate([
+      {
+        $group: {
+          _id: '$userId',
+          lastGoldTime: { $max: '$createTime' },
+          goldCount: { $sum: 1 }
+        }
+      }
+    ]);
+    
+    const goldLogMap = {};
+    goldLogs.forEach(log => {
+      goldLogMap[log._id] = log;
+    });
+    
     // 构建用户列表
     let newUsers = [];
+    const employeeIdSet = new Set(); // 用于去重
     
     for (const user of users) {
       const employee = employeeMap[user.employeeId];
+      
+      // 只处理Employee表中存在的用户
+      if (!employee) {
+        continue;
+      }
+      
+      // 去重：每个员工号只保留一条记录
+      if (employeeIdSet.has(user.employeeId)) {
+        continue;
+      }
+      employeeIdSet.add(user.employeeId);
+      
       const activity = activityMap[user.userId];
       const login = loginMap[user.userId];
+      const goldLog = goldLogMap[user.userId];
       
-      // 判断注册时间（使用最早的活动时间或登录时间）
-      const registerTime = activity?.firstActivity || login?.firstLogin || user.createdAt || new Date();
+      // 判断注册时间（优先使用Employee的createdAt）
+      const registerTime = employee.createdAt || activity?.firstActivity || login?.firstLogin || user.createdAt || new Date();
       
       // 时间范围筛选
       if (registerTime < startDate) {
         continue;
       }
       
-      // 判断是否上线（有活动记录或登录记录）
-      const isOnline = !!(activity || login);
+      // 判断是否上线（有活动记录、登录记录或金币记录）
+      const isOnline = !!(activity || login || goldLog);
       
       // 状态筛选
       if (status === 'online' && !isOnline) {
@@ -442,27 +487,25 @@ router.get('/new-users', authMiddleware, async (req, res) => {
       let groupName = '';
       let groupLeaderName = '';
       
-      if (employee) {
-        teamName = employee.teamName || '';
-        groupName = employee.groupName || '';
-        
-        // 获取团队长信息
-        if (employee.parentId) {
-          const teamLeader = adminMap[employee.parentId];
-          if (teamLeader) {
-            teamLeaderName = teamLeader.realName || teamLeader.username;
-          }
+      groupName = employee.groupName || '';
+      
+      // 获取团队长信息
+      if (employee.parentId) {
+        const teamLeader = adminMap[employee.parentId];
+        if (teamLeader) {
+          teamLeaderName = teamLeader.realName || teamLeader.username;
+          teamName = teamLeader.teamName || ''; // 从团队长信息中获取团队名称
         }
-        
-        // 获取组长信息
-        if (employee.teamGroupId) {
-          const groupLeader = admins.find(a => 
-            a.teamGroupId === employee.teamGroupId && 
-            a.role === 'NORMAL_ADMIN'
-          );
-          if (groupLeader) {
-            groupLeaderName = groupLeader.realName || groupLeader.username;
-          }
+      }
+      
+      // 获取组长信息
+      if (employee.teamGroupId) {
+        const groupLeader = admins.find(a => 
+          a.teamGroupId === employee.teamGroupId && 
+          a.role === 'NORMAL_ADMIN'
+        );
+        if (groupLeader) {
+          groupLeaderName = groupLeader.realName || groupLeader.username;
         }
       }
       
@@ -472,7 +515,7 @@ router.get('/new-users', authMiddleware, async (req, res) => {
       }
       
       // 组筛选
-      if (teamGroupId && employee?.teamGroupId !== teamGroupId) {
+      if (teamGroupId && employee.teamGroupId !== teamGroupId) {
         continue;
       }
       
@@ -482,7 +525,7 @@ router.get('/new-users', authMiddleware, async (req, res) => {
         if (currentAdmin) {
           if (currentAdmin.teamGroupId) {
             // 组长：只能看自己组的用户
-            if (employee?.teamGroupId !== currentAdmin.teamGroupId) {
+            if (employee.teamGroupId !== currentAdmin.teamGroupId) {
               continue;
             }
           } else if (currentAdmin.teamName) {
@@ -494,6 +537,9 @@ router.get('/new-users', authMiddleware, async (req, res) => {
         }
       }
       
+      // 计算最后活跃时间：优先使用金币记录时间，其次是活动记录，最后是登录记录
+      const lastActiveTime = goldLog?.lastGoldTime || activity?.lastActivity || login?.lastLogin || null;
+      
       newUsers.push({
         userId: user.userId,
         employeeId: user.employeeId,
@@ -503,8 +549,8 @@ router.get('/new-users', authMiddleware, async (req, res) => {
         teamLeaderName: teamLeaderName,
         groupName: groupName,
         groupLeaderName: groupLeaderName,
-        lastActiveTime: activity?.lastActivity || login?.lastLogin || null,
-        activityCount: activity?.activityCount || 0,
+        lastActiveTime: lastActiveTime,
+        activityCount: (activity?.activityCount || 0) + (goldLog?.goldCount || 0),
         loginDays: login?.loginDays || 0,
         currentMonthGold: user.currentMonthGold || 0
       });

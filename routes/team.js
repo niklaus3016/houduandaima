@@ -93,7 +93,9 @@ router.get('/list', authMiddleware, async (req, res) => {
     const lastMonthEnd = getLastMonthEnd();
     
     const teamsWithStats = await Promise.all(teams.map(async (team) => {
-      const memberIds = team.members ? team.members.map(m => m.userId) : [];
+      // 从员工表中获取属于该团队的员工
+      const employees = await Employee.find({ parentId: team.leaderId });
+      const memberIds = employees.map(emp => emp.employeeId);
       
       const todayGoldLogs = await GoldLog.find({
         employeeId: { $in: memberIds },
@@ -143,19 +145,19 @@ router.get('/list', authMiddleware, async (req, res) => {
         : 0;
       
       const todayLoginRecords = await LoginRecord.find({
-        userId: { $in: memberIds },
+        employeeId: { $in: memberIds },
         loginDate: { $gte: todayStart }
       });
-      const todayActiveUsers = new Set(todayLoginRecords.map(r => r.userId)).size;
+      const todayActiveUsers = new Set(todayLoginRecords.map(r => r.employeeId)).size;
       const todayActiveRate = memberIds.length > 0 
         ? ((todayActiveUsers / memberIds.length) * 100).toFixed(1) + '%' 
         : '0%';
       
       const monthLoginRecords = await LoginRecord.find({
-        userId: { $in: memberIds },
+        employeeId: { $in: memberIds },
         loginDate: { $gte: monthStart }
       });
-      const monthActiveUsers = new Set(monthLoginRecords.map(r => r.userId)).size;
+      const monthActiveUsers = new Set(monthLoginRecords.map(r => r.employeeId)).size;
       const monthlyActiveRate = memberIds.length > 0 
         ? ((monthActiveUsers / memberIds.length) * 100).toFixed(1) + '%' 
         : '0%';

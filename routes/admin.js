@@ -57,7 +57,9 @@ router.post('/login', async (req, res) => {
         admin: {
           id: admin._id,
           username: admin.username,
-          role: admin.role
+          role: admin.role,
+          teamName: admin.teamName,
+          teamGroupId: admin.teamGroupId
         }
       }
     });

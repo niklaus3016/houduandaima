@@ -308,9 +308,17 @@ router.get('/team-leaders', authMiddleware, async (req, res) => {
       .select('_id teamName realName username')
       .sort({ teamName: 1 });
     
-    const leaders = admins.map(admin => ({
-      _id: admin._id,
-      name: admin.teamName || admin.realName || admin.username
+    const leaders = await Promise.all(admins.map(async (admin) => {
+      // 计算团队成员数量
+      const memberCount = await Employee.countDocuments({ parentId: admin._id });
+      
+      return {
+        _id: admin._id,
+        username: admin.username,
+        realName: admin.realName || admin.username,
+        teamName: admin.teamName || '',
+        memberCount: memberCount
+      };
     }));
     
     res.json({

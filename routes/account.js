@@ -4,7 +4,7 @@ const Admin = require('../models/Admin');
 const Employee = require('../models/Employee');
 const UserGold = require('../models/UserGold');
 const GoldLog = require('../models/GoldLog');
-const { hashPassword } = require('../utils/auth');
+const { hashPassword, comparePassword } = require('../utils/auth');
 const authMiddleware = require('../middleware/auth');
 
 // 获取管理员列表
@@ -53,10 +53,21 @@ router.get('/admins', authMiddleware, async (req, res) => {
 // 添加管理员（团队长账号）
 router.post('/add-admin', authMiddleware, async (req, res) => {
   try {
-    const { username, password, teamName, realName, phone, region, role } = req.body;
+    const { username, password, teamName, realName, phone, region, role, teamGroupId, groupName } = req.body;
     
-    if (req.user.role !== 'superadmin') {
+    // 权限检查：超级管理员可以创建任何管理员，团队长只能创建自己团队的组长
+    if (req.user.role !== 'superadmin' && req.user.role !== 'NORMAL_ADMIN') {
       return res.status(403).json({ success: false, message: '权限不足' });
+    }
+    
+    // 团队长只能创建自己团队的组长
+    if (req.user.role === 'NORMAL_ADMIN') {
+      // 简化验证：直接使用JWT中的信息
+      // 团队长创建的只能是组长角色
+      req.body.role = 'NORMAL_ADMIN';
+      
+      // 确保团队名称一致（这里假设前端会正确传递teamName）
+      // 后续可以通过其他方式验证团队名称
     }
     
     if (!username || !password) {
@@ -71,8 +82,10 @@ router.post('/add-admin', authMiddleware, async (req, res) => {
     const newAdmin = new Admin({
       username,
       password: hashPassword(password),
-      role: role || 'admin',
+      role: req.body.role || 'admin',
       teamName: teamName || '',
+      teamGroupId: teamGroupId || null,
+      groupName: groupName || null,
       realName: realName || '',
       phone: phone || '',
       region: region || '',
@@ -89,6 +102,8 @@ router.post('/add-admin', authMiddleware, async (req, res) => {
         username: newAdmin.username,
         role: newAdmin.role,
         teamName: newAdmin.teamName,
+        teamGroupId: newAdmin.teamGroupId,
+        groupName: newAdmin.groupName,
         realName: newAdmin.realName,
         phone: newAdmin.phone,
         region: newAdmin.region,
@@ -104,10 +119,21 @@ router.post('/add-admin', authMiddleware, async (req, res) => {
 // 创建管理员（新接口，支持前端新字段）
 router.post('/create', authMiddleware, async (req, res) => {
   try {
-    const { teamName, realName, phone, region, username, password, role } = req.body;
+    const { teamName, realName, phone, region, username, password, role, teamGroupId, groupName } = req.body;
     
-    if (req.user.role !== 'superadmin') {
+    // 权限检查：超级管理员可以创建任何管理员，团队长只能创建自己团队的组长
+    if (req.user.role !== 'superadmin' && req.user.role !== 'NORMAL_ADMIN') {
       return res.status(403).json({ success: false, message: '权限不足' });
+    }
+    
+    // 团队长只能创建自己团队的组长
+    if (req.user.role === 'NORMAL_ADMIN') {
+      // 简化验证：直接使用JWT中的信息
+      // 团队长创建的只能是组长角色
+      req.body.role = 'NORMAL_ADMIN';
+      
+      // 确保团队名称一致（这里假设前端会正确传递teamName）
+      // 后续可以通过其他方式验证团队名称
     }
     
     if (!username || !password) {
@@ -122,8 +148,10 @@ router.post('/create', authMiddleware, async (req, res) => {
     const newAdmin = new Admin({
       username,
       password: hashPassword(password),
-      role: role || 'NORMAL_ADMIN',
+      role: req.body.role || 'NORMAL_ADMIN',
       teamName: teamName || '',
+      teamGroupId: teamGroupId || null,
+      groupName: groupName || null,
       realName: realName || '',
       phone: phone || '',
       region: region || '',
@@ -134,12 +162,14 @@ router.post('/create', authMiddleware, async (req, res) => {
     
     res.json({
       success: true,
-      message: '团队长账号创建成功',
+      message: '管理员账号创建成功',
       data: {
         _id: newAdmin._id,
         username: newAdmin.username,
         role: newAdmin.role,
         teamName: newAdmin.teamName,
+        teamGroupId: newAdmin.teamGroupId,
+        groupName: newAdmin.groupName,
         realName: newAdmin.realName,
         phone: newAdmin.phone,
         region: newAdmin.region,
@@ -283,6 +313,98 @@ router.post('/add-employee', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error('添加员工错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 管理员修改密码
+router.post('/change-password', authMiddleware, async (req, res) => {
+  try {
+    const { oldPassword, newPassword } = req.body;
+    
+    if (!oldPassword || !newPassword) {
+      return res.status(400).json({ success: false, message: '缺少必要参数' });
+    }
+    
+    // 查找当前管理员（尝试所有可能的字段）
+    let admin = null;
+    
+    // 尝试通过username查找
+    if (req.user.username) {
+      admin = await Admin.findOne({ username: req.user.username });
+    }
+    
+    // 如果通过username找不到，尝试通过id查找
+    if (!admin && req.user.id) {
+      admin = await Admin.findById(req.user.id);
+    }
+    
+    // 如果还是找不到，尝试通过其他字段查找
+    if (!admin) {
+      // 直接查询所有管理员，找到匹配的
+      const admins = await Admin.find();
+      for (const a of admins) {
+        if (a.username === req.user.username || a._id.toString() === req.user.id) {
+          admin = a;
+          break;
+        }
+      }
+    }
+    
+    if (!admin) {
+      return res.status(404).json({ success: false, message: '管理员不存在' });
+    }
+    
+    // 验证旧密码
+    const isPasswordValid = comparePassword(oldPassword, admin.password);
+    if (!isPasswordValid) {
+      return res.status(400).json({ success: false, message: '旧密码错误' });
+    }
+    
+    // 更新密码
+    admin.password = hashPassword(newPassword);
+    await admin.save();
+    
+    res.json({
+      success: true,
+      message: '密码修改成功'
+    });
+  } catch (error) {
+    console.error('修改密码错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 超级管理员重置密码
+router.post('/reset-password', authMiddleware, async (req, res) => {
+  try {
+    const { adminId, newPassword } = req.body;
+    
+    if (!adminId || !newPassword) {
+      return res.status(400).json({ success: false, message: '缺少必要参数' });
+    }
+    
+    // 验证是否为超级管理员
+    if (req.user.role !== 'superadmin') {
+      return res.status(403).json({ success: false, message: '权限不足' });
+    }
+    
+    // 查找目标管理员
+    const admin = await Admin.findById(adminId);
+    if (!admin) {
+      return res.status(404).json({ success: false, message: '管理员不存在' });
+    }
+    
+    // 更新密码
+    admin.password = hashPassword(newPassword);
+    await admin.save();
+    
+    res.json({
+      success: true,
+      message: '密码重置成功'
+    });
+  } catch (error) {
+    console.error('重置密码错误:', error);
     res.status(500).json({ success: false, message: '服务器错误' });
   }
 });

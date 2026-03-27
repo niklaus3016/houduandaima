@@ -36,7 +36,7 @@ router.post('/reward', async (req, res) => {
     // 计算金币（ECPM * 分成比例）
     const gold = ecpm * commissionRate;
     
-    // 更新用户金币
+    // 更新用户金币和广告次数
     let userGold = await UserGold.findOne({ userId });
     
     if (!userGold) {
@@ -45,11 +45,79 @@ router.post('/reward', async (req, res) => {
         userId,
         employeeId,
         currentMonthGold: gold,
-        lastMonthGold: 0
+        lastMonthGold: 0,
+        adCount: 1
       });
     } else {
-      // 更新当月金币
+      // 更新当月金币和广告次数
       userGold.currentMonthGold += gold;
+      userGold.adCount += 1;
+    }
+    
+    // 检查是否达到广告次数阈值，生成奖券
+    let ticketNumber = null;
+    let issueNumber = null;
+    try {
+      const LotterySettings = require('../models/LotterySettings');
+      const LotteryTicket = require('../models/LotteryTicket');
+      
+      // 获取彩票设置
+      let settings = await LotterySettings.findOne();
+      if (!settings) {
+        settings = new LotterySettings();
+        await settings.save();
+      }
+      
+      // 检查是否达到广告次数阈值
+      if (userGold.adCount >= settings.adCountThreshold) {
+        // 生成期号
+        const LotteryHistory = require('../models/LotteryHistory');
+        const latestHistory = await LotteryHistory.findOne(
+          { issueNumber: { $regex: /^\d+$/ } }
+        ).sort({ drawTime: -1 });
+        
+        if (latestHistory) {
+          const latestIssueNumber = parseInt(latestHistory.issueNumber);
+          issueNumber = (latestIssueNumber + 1).toString();
+        } else {
+          issueNumber = '1';
+        }
+        
+        // 生成6位随机数字奖券号码
+        function generateTicketNumber() {
+          return Math.floor(100000 + Math.random() * 900000).toString();
+        }
+        
+        ticketNumber = generateTicketNumber();
+        
+        // 计算有效期（下一次开奖时间）
+        const validUntil = new Date();
+        const [hours, minutes] = settings.drawTime.split(':').map(Number);
+        validUntil.setHours(hours, minutes, 0, 0);
+        
+        // 如果当前时间已经过了今天的开奖时间，则设置为明天的开奖时间
+        if (validUntil <= new Date()) {
+          validUntil.setDate(validUntil.getDate() + 1);
+        }
+        
+        // 创建奖券
+        const ticket = new LotteryTicket({
+          userId,
+          employeeId,
+          ticketNumber,
+          status: '有效',
+          issueNumber,
+          validUntil
+        });
+        
+        await ticket.save();
+        
+        // 重置广告次数
+        userGold.adCount = 0;
+      }
+    } catch (err) {
+      console.error('生成奖券错误:', err);
+      // 即使生成奖券失败，也继续发放金币
     }
     
     await userGold.save();
@@ -87,7 +155,40 @@ router.post('/reward', async (req, res) => {
     
     await goldLog.save();
     
-    res.json({ success: true, message: '金币发放成功', data: { gold, currentMonthGold: userGold.currentMonthGold } });
+    // 计算并添加2.5%到红包池
+    const redPacketAmount = gold * 0.025;
+    
+    // 更新红包池
+    let redPacketPoolConfig = await SystemConfig.findOne({ key: 'redPacketPool' });
+    if (!redPacketPoolConfig) {
+      redPacketPoolConfig = new SystemConfig({ key: 'redPacketPool', value: 0 });
+    }
+    redPacketPoolConfig.value += redPacketAmount;
+    await redPacketPoolConfig.save();
+    
+    // 计算并添加5%到奖金池
+    const lotteryAmount = gold * 0.05;
+    
+    // 更新奖金池
+    const LotteryPool = require('../models/LotteryPool');
+    let lotteryPool = await LotteryPool.findOne();
+    if (!lotteryPool) {
+      lotteryPool = new LotteryPool();
+    }
+    lotteryPool.currentAmount += lotteryAmount;
+    lotteryPool.totalAmount += lotteryAmount;
+    await lotteryPool.save();
+    
+    res.json({ 
+      success: true, 
+      message: '金币发放成功', 
+      data: { 
+        gold, 
+        currentMonthGold: userGold.currentMonthGold,
+        ticketNumber,
+        issueNumber
+      } 
+    });
   } catch (error) {
     console.error('发金币错误:', error);
     res.status(500).json({ success: false, message: '服务器错误' });

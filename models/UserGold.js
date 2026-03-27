@@ -21,6 +21,10 @@ const userGoldSchema = new mongoose.Schema({
   lastClaimedBonusDate: {
     type: String,
     default: ''
+  },
+  adCount: {
+    type: Number,
+    default: 0
   }
 });
 

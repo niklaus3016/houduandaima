@@ -22,6 +22,7 @@ const authMiddleware = (req, res, next) => {
     
     // Set user info in request
     req.user = decoded;
+    console.log('认证成功，用户信息:', req.user);
     
     next();
   } catch (error) {

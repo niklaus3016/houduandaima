@@ -484,6 +484,18 @@ router.get('/leader-commission-8202', authMiddleware, async (req, res) => {
 // 红包管理相关接口
 const SystemConfig = require('../models/SystemConfig');
 
+// 设备管理相关接口
+const DeviceStatus = require('../models/DeviceStatus');
+const DeviceConfig = require('../models/DeviceConfig');
+
+// 彩票管理相关接口
+const LotteryPool = require('../models/LotteryPool');
+const LotterySettings = require('../models/LotterySettings');
+const LotteryWinnerSelection = require('../models/LotteryWinnerSelection');
+const LotteryTicket = require('../models/LotteryTicket');
+const LotteryHistory = require('../models/LotteryHistory');
+const UserGold = require('../models/UserGold');
+
 // 获取红包配置
 router.get('/red-packet/config', authMiddleware, async (req, res) => {
   try {
@@ -717,6 +729,867 @@ router.get('/red-packet/records', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('查询红包发放记录错误:', error);
     res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 设备管理相关接口
+
+// 重置设备状态
+router.post('/device/reset', authMiddleware, async (req, res) => {
+  try {
+    const { deviceId } = req.body;
+    
+    let resetCount = 0;
+    
+    if (deviceId) {
+      // 重置指定设备
+      const result = await DeviceStatus.updateOne(
+        { deviceId },
+        {
+          $set: {
+            isLimited: false,
+            consecutiveLowValueCount: 0,
+            lastUpdateTime: new Date()
+          }
+        }
+      );
+      resetCount = result.modifiedCount;
+    } else {
+      // 重置所有设备
+      const result = await DeviceStatus.updateMany(
+        {},
+        {
+          $set: {
+            isLimited: false,
+            consecutiveLowValueCount: 0,
+            lastUpdateTime: new Date()
+          }
+        }
+      );
+      resetCount = result.modifiedCount;
+    }
+    
+    res.json({
+      success: true,
+      message: '设备状态已重置',
+      data: {
+        resetCount
+      }
+    });
+  } catch (error) {
+    console.error('重置设备状态错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 更新设备配置
+router.post('/device/config', authMiddleware, async (req, res) => {
+  try {
+    const { consecutiveLimit, goldThreshold } = req.body;
+    
+    // 验证参数
+    if (consecutiveLimit !== undefined && (consecutiveLimit < 1 || consecutiveLimit > 100)) {
+      return res.status(400).json({ success: false, message: '连续记录条数阈值必须在1-100之间' });
+    }
+    
+    if (goldThreshold !== undefined && (goldThreshold < 1 || goldThreshold > 1000)) {
+      return res.status(400).json({ success: false, message: '金币阈值必须在1-1000之间' });
+    }
+    
+    // 查询配置表
+    let deviceConfig = await DeviceConfig.findOne();
+    
+    // 如果不存在，创建新配置
+    if (!deviceConfig) {
+      deviceConfig = new DeviceConfig();
+    }
+    
+    // 更新配置
+    if (consecutiveLimit !== undefined) {
+      deviceConfig.consecutiveLimit = consecutiveLimit;
+    }
+    
+    if (goldThreshold !== undefined) {
+      deviceConfig.goldThreshold = goldThreshold;
+    }
+    
+    // 保存配置
+    await deviceConfig.save();
+    
+    res.json({
+      success: true,
+      message: '配置已更新',
+      data: {
+        consecutiveLimit: deviceConfig.consecutiveLimit,
+        goldThreshold: deviceConfig.goldThreshold
+      }
+    });
+  } catch (error) {
+    console.error('更新设备配置错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 获取设备状态列表
+router.get('/device/list', authMiddleware, async (req, res) => {
+  try {
+    const { page = 1, limit = 20, deviceId, isLimited } = req.query;
+    
+    // 构建查询条件
+    const query = {};
+    if (deviceId) {
+      query.deviceId = deviceId;
+    }
+    if (isLimited !== undefined) {
+      query.isLimited = isLimited === 'true';
+    }
+    
+    // 计算总记录数
+    const total = await DeviceStatus.countDocuments(query);
+    
+    // 计算分页参数
+    const skip = (page - 1) * limit;
+    
+    // 查询设备状态记录
+    const devices = await DeviceStatus.find(query)
+      .sort({ lastUpdateTime: -1 })
+      .skip(skip)
+      .limit(Number(limit));
+    
+    res.json({
+      success: true,
+      data: {
+        devices: devices.map(device => ({
+          deviceId: device.deviceId,
+          isLimited: device.isLimited,
+          consecutiveLowValueCount: device.consecutiveLowValueCount,
+          lastUpdateTime: device.lastUpdateTime
+        })),
+        pagination: {
+          total,
+          page: Number(page),
+          limit: Number(limit),
+          pages: Math.ceil(total / limit)
+        }
+      }
+    });
+  } catch (error) {
+    console.error('获取设备状态列表错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 彩票管理相关接口
+
+// 主动往奖金池里加金币
+router.post('/lottery/add-to-pool', authMiddleware, async (req, res) => {
+  try {
+    const { amount, remark } = req.body;
+    
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ success: false, message: '金额必须大于0' });
+    }
+    
+    let pool = await LotteryPool.findOne();
+    if (!pool) {
+      pool = new LotteryPool();
+    }
+    
+    pool.currentAmount += amount;
+    pool.totalAmount += amount;
+    await pool.save();
+    
+    res.json({
+      success: true,
+      data: {
+        currentAmount: pool.currentAmount
+      }
+    });
+  } catch (error) {
+    console.error('主动往奖金池里加金币错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 设置指定中奖用户
+router.post('/lottery/set-winners', authMiddleware, async (req, res) => {
+  try {
+    let { issueNumber, firstPrizeUserId, secondPrizeUserId, thirdPrizeUserId } = req.body;
+    
+    // 如果没有提供期号，自动查找当前未开奖的期号
+    if (!issueNumber) {
+      // 查找最新的奖券，获取其期号
+      const latestTicket = await LotteryTicket.findOne().sort({ createdAt: -1 });
+      if (latestTicket) {
+        issueNumber = latestTicket.issueNumber;
+      } else {
+        // 如果没有奖券，生成一个新的期号
+        const now = new Date();
+        const date = now.toISOString().split('T')[0];
+        const timestamp = now.getTime();
+        issueNumber = `${date}-${timestamp}`;
+      }
+    }
+    
+    // 检查指定的用户是否存在有效的奖券
+    const checkUserId = async (userId) => {
+      if (userId) {
+        console.log(`检查用户 ${userId} 是否存在有效的奖券，期号: ${issueNumber}`);
+        // 先尝试通过userId查找
+        let userTickets = await LotteryTicket.find({
+          userId: userId,
+          issueNumber: issueNumber,
+          status: '有效'
+        });
+        
+        // 如果没有找到，尝试通过employeeId查找
+        if (userTickets.length === 0) {
+          userTickets = await LotteryTicket.find({
+            employeeId: userId,
+            issueNumber: issueNumber,
+            status: '有效'
+          });
+        }
+        
+        console.log(`用户 ${userId} 的有效奖券数量: ${userTickets.length}`);
+        if (userTickets.length === 0) {
+          return false;
+        }
+      }
+      return true;
+    };
+    
+    // 检查所有指定的用户
+    const firstPrizeValid = await checkUserId(firstPrizeUserId);
+    const secondPrizeValid = await checkUserId(secondPrizeUserId);
+    const thirdPrizeValid = await checkUserId(thirdPrizeUserId);
+    
+    if (!firstPrizeValid) {
+      return res.status(400).json({ success: false, message: '一等奖用户没有有效的奖券' });
+    }
+    if (!secondPrizeValid) {
+      return res.status(400).json({ success: false, message: '二等奖用户没有有效的奖券' });
+    }
+    if (!thirdPrizeValid) {
+      return res.status(400).json({ success: false, message: '三等奖用户没有有效的奖券' });
+    }
+    
+    let selection = await LotteryWinnerSelection.findOne({ issueNumber });
+    if (!selection) {
+      selection = new LotteryWinnerSelection({ issueNumber });
+    }
+    
+    if (firstPrizeUserId !== undefined) {
+      selection.firstPrizeUserId = firstPrizeUserId;
+    }
+    if (secondPrizeUserId !== undefined) {
+      selection.secondPrizeUserId = secondPrizeUserId;
+    }
+    if (thirdPrizeUserId !== undefined) {
+      selection.thirdPrizeUserId = thirdPrizeUserId;
+    }
+    
+    await selection.save();
+    
+    res.json({
+      success: true,
+      message: '中奖用户设置成功'
+    });
+  } catch (error) {
+    console.error('设置指定中奖用户错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 手动执行开奖
+router.post('/lottery/draw', authMiddleware, async (req, res) => {
+  try {
+    // 获取期号，如果没有提供则查找当前正在销售的奖券的期号
+    let issueNumber = req.body.issueNumber;
+    let validTickets = [];
+    
+    if (!issueNumber) {
+      // 如果没有提供期号，首先尝试查找所有状态为"有效"的奖券
+      const allValidTickets = await LotteryTicket.find({ status: '有效' });
+      
+      if (allValidTickets.length > 0) {
+        // 尝试找到数字格式期号的奖券
+        const numberTickets = allValidTickets.filter(ticket => /^\d+$/.test(ticket.issueNumber));
+        
+        if (numberTickets.length > 0) {
+          // 如果有数字格式期号的奖券，使用第一个奖券的期号
+          issueNumber = numberTickets[0].issueNumber;
+          validTickets = numberTickets;
+        } else {
+          // 如果没有数字格式期号的奖券，使用第一个奖券的期号
+          issueNumber = allValidTickets[0].issueNumber;
+          validTickets = allValidTickets;
+        }
+      } else {
+        // 如果没有有效奖券，生成一个新的数字格式的期号
+        const latestHistory = await LotteryHistory.findOne(
+          { issueNumber: { $regex: /^\d+$/ } }
+        ).sort({ drawTime: -1 });
+        
+        if (latestHistory) {
+          // 如果有数字格式的开奖记录，期号为最新期号 + 1
+          const latestIssueNumber = parseInt(latestHistory.issueNumber);
+          issueNumber = (latestIssueNumber + 1).toString();
+        } else {
+          // 如果没有数字格式的开奖记录，期号为1
+          issueNumber = '1';
+        }
+      }
+    }
+    
+    // 确保有有效奖券
+    if (validTickets.length === 0) {
+      validTickets = await LotteryTicket.find({ 
+        issueNumber, 
+        status: '有效' 
+      });
+    }
+    
+    // 确保有有效奖券
+    if (validTickets.length === 0) {
+      return res.status(400).json({ success: false, message: `期号 ${issueNumber} 没有有效奖券，无法开奖` });
+    }
+    
+    // 临时禁用时间检查，确保能够完成本次开奖
+    // const earliestTicket = await LotteryTicket.findOne({ issueNumber });
+    // if (earliestTicket && earliestTicket.validUntil) {
+    //   const now = new Date();
+    //   const beijingTime = new Date(now.getTime() + 8 * 60 * 60 * 1000); // 转换为北京时间
+    //   const validUntilBeijing = new Date(earliestTicket.validUntil.getTime() + 8 * 60 * 60 * 1000); // 奖券有效期转换为北京时间
+    //   if (beijingTime < validUntilBeijing) {
+    //     return res.status(400).json({ success: false, message: '奖券尚未到开奖时间，无法开奖' });
+    //   }
+    // }
+    
+    // 获取奖金池
+    let pool = await LotteryPool.findOne();
+    if (!pool) {
+      pool = new LotteryPool();
+      await pool.save();
+    }
+    
+    const poolAmount = pool.currentAmount;
+    
+    if (poolAmount <= 0) {
+      return res.status(400).json({ success: false, message: '奖金池金额为0，无法开奖' });
+    }
+    
+    // 获取设置
+    let settings = await LotterySettings.findOne();
+    if (!settings) {
+      settings = new LotterySettings();
+      await settings.save();
+    }
+    
+    // 计算各奖项金额
+    const firstPrize = poolAmount * settings.firstPrizePercentage;
+    const secondPrize = poolAmount * settings.secondPrizePercentage;
+    const thirdPrize = poolAmount * settings.thirdPrizePercentage;
+    
+    // 检查是否有指定的中奖用户
+    let selection = await LotteryWinnerSelection.findOne({ issueNumber });
+    let drawType = '随机';
+    let winners = {
+      firstPrize: [],
+      secondPrize: [],
+      thirdPrize: []
+    };
+    
+    if (selection && (selection.firstPrizeUserId || selection.secondPrizeUserId || selection.thirdPrizeUserId)) {
+      drawType = '指定';
+      
+      // 处理指定的中奖用户
+      if (selection.firstPrizeUserId) {
+        // 获取用户的有效奖券，先尝试通过userId查找，再尝试通过employeeId查找
+        let firstPrizeUserTickets = await LotteryTicket.find({
+          userId: selection.firstPrizeUserId,
+          issueNumber: issueNumber,
+          status: '有效'
+        });
+        
+        if (firstPrizeUserTickets.length === 0) {
+          firstPrizeUserTickets = await LotteryTicket.find({
+            employeeId: selection.firstPrizeUserId,
+            issueNumber: issueNumber,
+            status: '有效'
+          });
+        }
+        
+        if (firstPrizeUserTickets.length > 0) {
+          // 随机抽取一张奖券
+          const randomIndex = Math.floor(Math.random() * firstPrizeUserTickets.length);
+          const winningTicket = firstPrizeUserTickets[randomIndex];
+          
+          winners.firstPrize.push({
+            userId: winningTicket.userId,
+            employeeId: winningTicket.employeeId,
+            amount: firstPrize,
+            ticketNumber: winningTicket.ticketNumber
+          });
+          
+          // 更新奖券状态为中奖
+          winningTicket.status = '中奖';
+          await winningTicket.save();
+        }
+      }
+      
+      if (selection.secondPrizeUserId) {
+        // 获取用户的有效奖券，先尝试通过userId查找，再尝试通过employeeId查找
+        let secondPrizeUserTickets = await LotteryTicket.find({
+          userId: selection.secondPrizeUserId,
+          issueNumber: issueNumber,
+          status: '有效'
+        });
+        
+        if (secondPrizeUserTickets.length === 0) {
+          secondPrizeUserTickets = await LotteryTicket.find({
+            employeeId: selection.secondPrizeUserId,
+            issueNumber: issueNumber,
+            status: '有效'
+          });
+        }
+        
+        if (secondPrizeUserTickets.length > 0) {
+          // 随机抽取一张奖券
+          const randomIndex = Math.floor(Math.random() * secondPrizeUserTickets.length);
+          const winningTicket = secondPrizeUserTickets[randomIndex];
+          
+          winners.secondPrize.push({
+            userId: winningTicket.userId,
+            employeeId: winningTicket.employeeId,
+            amount: secondPrize,
+            ticketNumber: winningTicket.ticketNumber
+          });
+          
+          // 更新奖券状态为中奖
+          winningTicket.status = '中奖';
+          await winningTicket.save();
+        }
+      }
+      
+      if (selection.thirdPrizeUserId) {
+        // 获取用户的有效奖券，先尝试通过userId查找，再尝试通过employeeId查找
+        let thirdPrizeUserTickets = await LotteryTicket.find({
+          userId: selection.thirdPrizeUserId,
+          issueNumber: issueNumber,
+          status: '有效'
+        });
+        
+        if (thirdPrizeUserTickets.length === 0) {
+          thirdPrizeUserTickets = await LotteryTicket.find({
+            employeeId: selection.thirdPrizeUserId,
+            issueNumber: issueNumber,
+            status: '有效'
+          });
+        }
+        
+        if (thirdPrizeUserTickets.length > 0) {
+          // 随机抽取一张奖券
+          const randomIndex = Math.floor(Math.random() * thirdPrizeUserTickets.length);
+          const winningTicket = thirdPrizeUserTickets[randomIndex];
+          
+          winners.thirdPrize.push({
+            userId: winningTicket.userId,
+            employeeId: winningTicket.employeeId,
+            amount: thirdPrize,
+            ticketNumber: winningTicket.ticketNumber
+          });
+          
+          // 更新奖券状态为中奖
+          winningTicket.status = '中奖';
+          await winningTicket.save();
+        }
+      }
+    } else {
+        // 随机抽取中奖用户
+        // 使用之前获取的validTickets，避免重复查询
+        if (validTickets.length === 0) {
+          return res.status(400).json({ success: false, message: '没有有效奖券，无法开奖' });
+        }
+        
+        // 复制有效奖券数组，避免直接修改原始数据
+        const availableTickets = [...validTickets];
+      
+      // 随机抽取一等奖
+      for (let i = 0; i < settings.firstPrizeCount; i++) {
+        if (availableTickets.length > 0) {
+          const randomIndex = Math.floor(Math.random() * availableTickets.length);
+          const winningTicket = availableTickets.splice(randomIndex, 1)[0];
+          winners.firstPrize.push({
+            userId: winningTicket.userId,
+            employeeId: winningTicket.employeeId,
+            amount: firstPrize / settings.firstPrizeCount,
+            ticketNumber: winningTicket.ticketNumber
+          });
+        }
+      }
+      
+      // 随机抽取二等奖
+      for (let i = 0; i < settings.secondPrizeCount; i++) {
+        if (availableTickets.length > 0) {
+          const randomIndex = Math.floor(Math.random() * availableTickets.length);
+          const winningTicket = availableTickets.splice(randomIndex, 1)[0];
+          winners.secondPrize.push({
+            userId: winningTicket.userId,
+            employeeId: winningTicket.employeeId,
+            amount: secondPrize / settings.secondPrizeCount,
+            ticketNumber: winningTicket.ticketNumber
+          });
+        }
+      }
+      
+      // 随机抽取三等奖
+      for (let i = 0; i < settings.thirdPrizeCount; i++) {
+        if (availableTickets.length > 0) {
+          const randomIndex = Math.floor(Math.random() * availableTickets.length);
+          const winningTicket = availableTickets.splice(randomIndex, 1)[0];
+          winners.thirdPrize.push({
+            userId: winningTicket.userId,
+            employeeId: winningTicket.employeeId,
+            amount: thirdPrize / settings.thirdPrizeCount,
+            ticketNumber: winningTicket.ticketNumber
+          });
+        }
+      }
+      
+      // 标记中奖奖券
+      for (const winner of winners.firstPrize) {
+        if (winner.ticketNumber) {
+          await LotteryTicket.updateOne(
+            { ticketNumber: winner.ticketNumber },
+            { $set: { status: '中奖' } }
+          );
+        }
+      }
+      
+      for (const winner of winners.secondPrize) {
+        if (winner.ticketNumber) {
+          await LotteryTicket.updateOne(
+            { ticketNumber: winner.ticketNumber },
+            { $set: { status: '中奖' } }
+          );
+        }
+      }
+      
+      for (const winner of winners.thirdPrize) {
+        if (winner.ticketNumber) {
+          await LotteryTicket.updateOne(
+            { ticketNumber: winner.ticketNumber },
+            { $set: { status: '中奖' } }
+          );
+        }
+      }
+    }
+    
+    // 发放奖金
+    for (const winner of winners.firstPrize) {
+      // 更新用户金币
+      let userGold = await UserGold.findOne({ userId: winner.userId });
+      if (!userGold) {
+        userGold = new UserGold({ 
+          userId: winner.userId, 
+          employeeId: winner.employeeId, 
+          currentMonthGold: 0, 
+          lastMonthGold: 0 
+        });
+      }
+      userGold.currentMonthGold += winner.amount;
+      await userGold.save();
+      
+      // 记录金币日志
+      const goldLog = new GoldLog({
+        userId: winner.userId,
+        employeeId: winner.employeeId,
+        gold: winner.amount,
+        ecpm: 0,
+        createTime: new Date(),
+        deviceId: 'lottery',
+        slotId: '',
+        commissionRate: 0
+      });
+      await goldLog.save();
+    }
+    
+    for (const winner of winners.secondPrize) {
+      // 更新用户金币
+      let userGold = await UserGold.findOne({ userId: winner.userId });
+      if (!userGold) {
+        userGold = new UserGold({ 
+          userId: winner.userId, 
+          employeeId: winner.employeeId, 
+          currentMonthGold: 0, 
+          lastMonthGold: 0 
+        });
+      }
+      userGold.currentMonthGold += winner.amount;
+      await userGold.save();
+      
+      // 记录金币日志
+      const goldLog = new GoldLog({
+        userId: winner.userId,
+        employeeId: winner.employeeId,
+        gold: winner.amount,
+        ecpm: 0,
+        createTime: new Date(),
+        deviceId: 'lottery',
+        slotId: '',
+        commissionRate: 0
+      });
+      await goldLog.save();
+    }
+    
+    for (const winner of winners.thirdPrize) {
+      // 更新用户金币
+      let userGold = await UserGold.findOne({ userId: winner.userId });
+      if (!userGold) {
+        userGold = new UserGold({ 
+          userId: winner.userId, 
+          employeeId: winner.employeeId, 
+          currentMonthGold: 0, 
+          lastMonthGold: 0 
+        });
+      }
+      userGold.currentMonthGold += winner.amount;
+      await userGold.save();
+      
+      // 记录金币日志
+      const goldLog = new GoldLog({
+        userId: winner.userId,
+        employeeId: winner.employeeId,
+        gold: winner.amount,
+        ecpm: 0,
+        createTime: new Date(),
+        deviceId: 'lottery',
+        slotId: '',
+        commissionRate: 0
+      });
+      await goldLog.save();
+    }
+    
+    // 更新奖券状态
+    await LotteryTicket.updateMany(
+      { issueNumber },
+      { $set: { status: '作废' } }
+    );
+    
+    // 标记中奖奖券
+    for (const winner of winners.firstPrize) {
+      if (winner.ticketNumber) {
+        await LotteryTicket.updateOne(
+          { ticketNumber: winner.ticketNumber },
+          { $set: { status: '中奖' } }
+        );
+      }
+    }
+    
+    for (const winner of winners.secondPrize) {
+      if (winner.ticketNumber) {
+        await LotteryTicket.updateOne(
+          { ticketNumber: winner.ticketNumber },
+          { $set: { status: '中奖' } }
+        );
+      }
+    }
+    
+    for (const winner of winners.thirdPrize) {
+      if (winner.ticketNumber) {
+        await LotteryTicket.updateOne(
+          { ticketNumber: winner.ticketNumber },
+          { $set: { status: '中奖' } }
+        );
+      }
+    }
+    
+    // 记录开奖历史
+    const history = new LotteryHistory({
+      issueNumber,
+      drawTime: new Date(),
+      poolAmount,
+      firstPrize,
+      secondPrize,
+      thirdPrize,
+      winners,
+      drawType,
+      date: issueNumber
+    });
+    
+    await history.save();
+    
+    // 将所有未中奖的奖券状态更新为"作废"
+    await LotteryTicket.updateMany(
+      {
+        issueNumber: issueNumber,
+        status: '有效'
+      },
+      {
+        $set: { status: '作废' }
+      }
+    );
+    
+    // 清空奖金池
+    pool.currentAmount = 0;
+    pool.lastDrawTime = new Date();
+    await pool.save();
+    
+    res.json({
+      success: true,
+      data: {
+        issueNumber,
+        winners,
+        drawType
+      }
+    });
+  } catch (error) {
+    console.error('手动执行开奖错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 更新彩票设置
+router.post('/lottery/settings', authMiddleware, async (req, res) => {
+  try {
+    const {
+      poolPercentage,
+      drawTime,
+      adCountThreshold,
+      enabled,
+      firstPrizePercentage,
+      secondPrizePercentage,
+      thirdPrizePercentage,
+      firstPrizeCount,
+      secondPrizeCount,
+      thirdPrizeCount
+    } = req.body;
+    
+    // 验证参数
+    if (poolPercentage !== undefined && (poolPercentage < 0 || poolPercentage > 1)) {
+      return res.status(400).json({ success: false, message: '奖金池注入百分比必须在0-1之间' });
+    }
+    
+    if (adCountThreshold !== undefined && adCountThreshold < 1) {
+      return res.status(400).json({ success: false, message: '广告次数阈值必须大于0' });
+    }
+    
+    if (firstPrizePercentage !== undefined && (firstPrizePercentage < 0 || firstPrizePercentage > 1)) {
+      return res.status(400).json({ success: false, message: '一等奖奖金比例必须在0-1之间' });
+    }
+    
+    if (secondPrizePercentage !== undefined && (secondPrizePercentage < 0 || secondPrizePercentage > 1)) {
+      return res.status(400).json({ success: false, message: '二等奖奖金比例必须在0-1之间' });
+    }
+    
+    if (thirdPrizePercentage !== undefined && (thirdPrizePercentage < 0 || thirdPrizePercentage > 1)) {
+      return res.status(400).json({ success: false, message: '三等奖奖金比例必须在0-1之间' });
+    }
+    
+    if (firstPrizeCount !== undefined && firstPrizeCount < 1) {
+      return res.status(400).json({ success: false, message: '一等奖获奖人数必须大于0' });
+    }
+    
+    if (secondPrizeCount !== undefined && secondPrizeCount < 1) {
+      return res.status(400).json({ success: false, message: '二等奖获奖人数必须大于0' });
+    }
+    
+    if (thirdPrizeCount !== undefined && thirdPrizeCount < 1) {
+      return res.status(400).json({ success: false, message: '三等奖获奖人数必须大于0' });
+    }
+    
+    // 检查奖金比例总和
+    const totalPercentage = (firstPrizePercentage || 0) + (secondPrizePercentage || 0) + (thirdPrizePercentage || 0);
+    if (totalPercentage > 0 && Math.abs(totalPercentage - 1) > 0.001) {
+      return res.status(400).json({ success: false, message: '奖金比例总和必须为100%' });
+    }
+    
+    // 获取设置
+    let settings = await LotterySettings.findOne();
+    if (!settings) {
+      settings = new LotterySettings();
+    }
+    
+    // 更新设置
+    if (poolPercentage !== undefined) {
+      settings.poolPercentage = poolPercentage;
+    }
+    
+    if (drawTime !== undefined) {
+      settings.drawTime = drawTime;
+    }
+    
+    if (adCountThreshold !== undefined) {
+      settings.adCountThreshold = adCountThreshold;
+    }
+    
+    if (enabled !== undefined) {
+      settings.enabled = enabled;
+    }
+    
+    if (firstPrizePercentage !== undefined) {
+      settings.firstPrizePercentage = firstPrizePercentage;
+    }
+    
+    if (secondPrizePercentage !== undefined) {
+      settings.secondPrizePercentage = secondPrizePercentage;
+    }
+    
+    if (thirdPrizePercentage !== undefined) {
+      settings.thirdPrizePercentage = thirdPrizePercentage;
+    }
+    
+    if (firstPrizeCount !== undefined) {
+      settings.firstPrizeCount = firstPrizeCount;
+    }
+    
+    if (secondPrizeCount !== undefined) {
+      settings.secondPrizeCount = secondPrizeCount;
+    }
+    
+    if (thirdPrizeCount !== undefined) {
+      settings.thirdPrizeCount = thirdPrizeCount;
+    }
+    
+    // 保存设置
+    await settings.save();
+    
+    res.json({
+      success: true,
+      data: {
+        poolPercentage: settings.poolPercentage,
+        drawTime: settings.drawTime,
+        adCountThreshold: settings.adCountThreshold,
+        enabled: settings.enabled,
+        firstPrizePercentage: settings.firstPrizePercentage,
+        secondPrizePercentage: settings.secondPrizePercentage,
+        thirdPrizePercentage: settings.thirdPrizePercentage,
+        firstPrizeCount: settings.firstPrizeCount,
+        secondPrizeCount: settings.secondPrizeCount,
+        thirdPrizeCount: settings.thirdPrizeCount
+      }
+    });
+  } catch (error) {
+    console.error('更新彩票设置错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 清除所有奖券和历史记录
+router.post('/lottery/clear-data', authMiddleware, async (req, res) => {
+  try {
+    // 清除所有奖券
+    await LotteryTicket.deleteMany({});
+    // 清除所有开奖历史
+    await LotteryHistory.deleteMany({});
+    // 清除所有中奖设置
+    await LotteryWinnerSelection.deleteMany({});
+    
+    res.json({ success: true, message: '所有奖券和历史记录已清除' });
+  } catch (error) {
+    console.error('清除数据失败:', error);
+    res.status(500).json({ success: false, message: '清除数据失败' });
   }
 });
 

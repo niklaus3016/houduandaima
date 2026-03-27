@@ -23,6 +23,9 @@ const teamPublicRoutes = require('./routes/teamPublic');
 const newuserPublicRoutes = require('./routes/newuserPublic');
 const healthRoutes = require('./routes/health');
 const groupRoutes = require('./routes/group');
+const poolRoutes = require('./routes/pool');
+const deviceRoutes = require('./routes/device');
+const lotteryRoutes = require('./routes/lottery');
 
 const app = express();
 const PORT = process.env.PORT || 3003;
@@ -57,12 +60,18 @@ app.use('/api/team', teamPublicRoutes);
 app.use('/api/newuser', newuserPublicRoutes);
 app.use('/api/health', healthRoutes);
 app.use('/api/group', groupRoutes);
+app.use('/api/pool', poolRoutes);
+app.use('/api/device', deviceRoutes);
+app.use('/api/lottery', lotteryRoutes);
 
 // 连接MongoDB
 mongoose.connect(MONGODB_URI)
   .then(() => {
     console.log('MongoDB连接成功');
-    app.listen(PORT, () => {
+    
+    // 移除自动开奖监控，所有开奖由超管手动控制
+    
+    app.listen(PORT, '0.0.0.0', () => {
       console.log(`服务器运行在端口 ${PORT}`);
     });
   })

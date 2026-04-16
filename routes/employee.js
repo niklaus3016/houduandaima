@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const Employee = require('../models/Employee');
 const UserGold = require('../models/UserGold');
+const { generateToken } = require('../utils/auth');
 
 // 生成4位随机员工号
 function generateEmployeeId() {
@@ -54,13 +55,21 @@ router.post('/check', async (req, res) => {
       userId = userGold.userId;
     }
     
+    // 生成token
+    const token = generateToken({
+      _id: employee._id,
+      username: employeeId,
+      role: employee.role || 'EMPLOYEE'
+    });
+    
     res.json({ 
       success: true, 
       message: '登录成功', 
       data: {
         ...employee.toObject(),
         userId: userId
-      }
+      },
+      token: token
     });
   } catch (error) {
     console.error('登录校验错误:', error);
@@ -280,8 +289,14 @@ router.post('/reward-gold', async (req, res) => {
     redPacketPoolConfig.value += poolAmount;
     await redPacketPoolConfig.save();
     
-    // 计算并添加5%到奖金池
-    const lotteryAmount = gold * 0.05;
+    // 计算并添加到奖金池
+    const LotterySettings = require('../models/LotterySettings');
+    let settings = await LotterySettings.findOne();
+    if (!settings) {
+      settings = new LotterySettings();
+      await settings.save();
+    }
+    const lotteryAmount = gold * settings.poolPercentage;
     
     // 更新奖金池
     const LotteryPool = require('../models/LotteryPool');

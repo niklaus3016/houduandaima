@@ -26,6 +26,10 @@ const groupRoutes = require('./routes/group');
 const poolRoutes = require('./routes/pool');
 const deviceRoutes = require('./routes/device');
 const lotteryRoutes = require('./routes/lottery');
+const verificationRoutes = require('./routes/verification');
+const weeklyTargetRoutes = require('./routes/weeklyTarget');
+const weeklyBonusRoutes = require('./routes/weeklyBonus');
+const welfareRoutes = require('./routes/welfare');
 
 const app = express();
 const PORT = process.env.PORT || 3003;
@@ -34,6 +38,19 @@ const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://root:9yx7pAD9851A7W7Q@
 // 中间件
 app.use(cors());
 app.use(express.json());
+
+// 静态文件服务
+const path = require('path');
+const uploadPath = path.join(__dirname, 'uploads');
+const fs = require('fs');
+
+// 确保上传目录存在
+if (!fs.existsSync(uploadPath)) {
+  fs.mkdirSync(uploadPath, { recursive: true });
+}
+
+// 配置静态文件服务
+app.use('/uploads', express.static(uploadPath));
 
 // 路由
 app.use('/api/employee', employeeRoutes);
@@ -63,6 +80,10 @@ app.use('/api/group', groupRoutes);
 app.use('/api/pool', poolRoutes);
 app.use('/api/device', deviceRoutes);
 app.use('/api/lottery', lotteryRoutes);
+app.use('/api', verificationRoutes);
+app.use('/api', welfareRoutes);
+app.use('/api/weeklyTarget', weeklyTargetRoutes);
+app.use('/api/weeklyBonus', weeklyBonusRoutes);
 
 // 连接MongoDB
 mongoose.connect(MONGODB_URI)

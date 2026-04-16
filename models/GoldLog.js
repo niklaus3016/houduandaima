@@ -11,11 +11,11 @@ const goldLogSchema = new mongoose.Schema({
   },
   deviceId: {
     type: String,
-    required: true
+    default: ''
   },
   ecpm: {
     type: Number,
-    required: true
+    default: 0
   },
   gold: {
     type: Number,
@@ -28,6 +28,10 @@ const goldLogSchema = new mongoose.Schema({
   commissionRate: {
     type: Number,
     default: 0
+  },
+  type: {
+    type: String,
+    default: 'income'
   },
   createTime: {
     type: Date,

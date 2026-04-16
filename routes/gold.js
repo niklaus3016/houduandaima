@@ -155,8 +155,10 @@ router.post('/reward', async (req, res) => {
     
     await goldLog.save();
     
-    // 计算并添加2.5%到红包池
-    const redPacketAmount = gold * 0.025;
+    // 计算并添加到红包池
+    const SystemConfig = require('../models/SystemConfig');
+    const injectRateConfig = await SystemConfig.findOne({ key: 'redPacketInjectRate' }) || { value: 0.025 };
+    const redPacketAmount = gold * injectRateConfig.value;
     
     // 更新红包池
     let redPacketPoolConfig = await SystemConfig.findOne({ key: 'redPacketPool' });
@@ -166,8 +168,14 @@ router.post('/reward', async (req, res) => {
     redPacketPoolConfig.value += redPacketAmount;
     await redPacketPoolConfig.save();
     
-    // 计算并添加5%到奖金池
-    const lotteryAmount = gold * 0.05;
+    // 计算并添加到奖金池
+    const LotterySettings = require('../models/LotterySettings');
+    let settings = await LotterySettings.findOne();
+    if (!settings) {
+      settings = new LotterySettings();
+      await settings.save();
+    }
+    const lotteryAmount = gold * settings.poolPercentage;
     
     // 更新奖金池
     const LotteryPool = require('../models/LotteryPool');
@@ -364,6 +372,81 @@ router.get('/deduct/history', async (req, res) => {
     });
   } catch (error) {
     console.error('获取核减历史错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 超管调整用户金币
+router.post('/admin/adjust', authMiddleware, async (req, res) => {
+  try {
+    const { employeeId, currentMonthGold, lastMonthGold, reason } = req.body;
+    const operator = req.admin?.username || 'admin';
+    
+    if (!employeeId) {
+      return res.status(400).json({ success: false, message: '缺少员工ID参数' });
+    }
+    
+    // 查找用户金币记录
+    const userGold = await UserGold.findOne({ employeeId });
+    if (!userGold) {
+      return res.status(404).json({ success: false, message: '用户金币记录不存在' });
+    }
+    
+    // 记录调整前的金币数量
+    const oldCurrentMonthGold = userGold.currentMonthGold;
+    const oldLastMonthGold = userGold.lastMonthGold;
+    
+    // 调整金币
+    if (currentMonthGold !== undefined) {
+      userGold.currentMonthGold = currentMonthGold;
+    }
+    if (lastMonthGold !== undefined) {
+      userGold.lastMonthGold = lastMonthGold;
+    }
+    
+    await userGold.save();
+    
+    // 记录调整操作（可以根据需要创建新的模型来记录调整历史）
+    console.log(`超管 ${operator} 调整用户 ${employeeId} 的金币: 本月金币从 ${oldCurrentMonthGold} 调整为 ${userGold.currentMonthGold}, 上月金币从 ${oldLastMonthGold} 调整为 ${userGold.lastMonthGold}, 原因: ${reason || '无'}`);
+    
+    res.json({
+      success: true,
+      message: '金币调整成功',
+      data: {
+        employeeId,
+        currentMonthGold: userGold.currentMonthGold,
+        lastMonthGold: userGold.lastMonthGold,
+        totalGold: userGold.currentMonthGold + userGold.lastMonthGold
+      }
+    });
+  } catch (error) {
+    console.error('调整金币错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 获取用户金币详情
+router.get('/admin/user/:employeeId', authMiddleware, async (req, res) => {
+  try {
+    const { employeeId } = req.params;
+    
+    const userGold = await UserGold.findOne({ employeeId });
+    if (!userGold) {
+      return res.status(404).json({ success: false, message: '用户金币记录不存在' });
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        employeeId: userGold.employeeId,
+        currentMonthGold: userGold.currentMonthGold,
+        lastMonthGold: userGold.lastMonthGold,
+        totalGold: userGold.currentMonthGold + userGold.lastMonthGold,
+        adCount: userGold.adCount
+      }
+    });
+  } catch (error) {
+    console.error('获取用户金币详情错误:', error);
     res.status(500).json({ success: false, message: '服务器错误' });
   }
 });

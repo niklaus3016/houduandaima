@@ -3,13 +3,42 @@ const router = express.Router();
 const UserGold = require('../models/UserGold');
 const UserActivity = require('../models/UserActivity');
 const LoginRecord = require('../models/LoginRecord');
-const DailyTarget = require('../models/DailyTarget');
-const DailyBonusClaim = require('../models/DailyBonusClaim');
 const GoldLog = require('../models/GoldLog');
 const Employee = require('../models/Employee');
 const Team = require('../models/Team');
 const Admin = require('../models/Admin');
+const WeeklyTarget = require('../models/WeeklyTarget');
+const WeeklyBonusClaim = require('../models/WeeklyBonusClaim');
 const authMiddleware = require('../middleware/auth');
+
+// 获取当前周（YYYY-WW 格式）
+function getCurrentWeek() {
+  const now = new Date();
+  const startOfYear = new Date(now.getFullYear(), 0, 1);
+  const days = Math.floor((now - startOfYear) / (24 * 60 * 60 * 1000));
+  const weekNumber = Math.ceil((days + startOfYear.getDay() + 1) / 7);
+  return `${now.getFullYear()}-${weekNumber.toString().padStart(2, '0')}`;
+}
+
+// 获取周开始和结束时间（北京时间）
+function getWeekRange(week) {
+  const [year, weekNumber] = week.split('-').map(Number);
+  const startOfYear = new Date(year, 0, 1);
+  const days = (weekNumber - 1) * 7 - startOfYear.getDay() + 1;
+  const weekStart = new Date(startOfYear);
+  weekStart.setDate(weekStart.getDate() + days);
+  weekStart.setHours(0, 0, 0, 0);
+  
+  const weekEnd = new Date(weekStart);
+  weekEnd.setDate(weekEnd.getDate() + 7);
+  weekEnd.setHours(0, 0, 0, 0);
+  
+  // 转换为UTC时间
+  return {
+    start: new Date(weekStart.getTime() - 8 * 60 * 60 * 1000),
+    end: new Date(weekEnd.getTime() - 8 * 60 * 60 * 1000)
+  };
+}
 
 // 获取北京时间
 function getBeijingDate() {
@@ -60,19 +89,36 @@ router.get('/info', async (req, res) => {
       await userGold.save();
     }
     
-    // 获取今日目标任务（北京时间）
-    const beijingNow = getBeijingDate();
-    const today = beijingNow.toISOString().split('T')[0];
-    const dailyTarget = await DailyTarget.findOne({ date: today });
+    // 获取本周目标任务
+    const currentWeek = getCurrentWeek();
+    const weeklyTarget = await WeeklyTarget.findOne({ week: currentWeek });
     
-    // 检查用户今日是否已领取额外金币
-    const hasClaimedBonus = userGold.lastClaimedBonusDate === today;
+    // 检查用户本周是否已领取额外金币
+    const hasClaimedBonus = await WeeklyBonusClaim.exists({
+      userId: userId,
+      employeeId: employeeId,
+      week: currentWeek
+    });
+    
+    // 计算本周收益条数
+    let currentCount = 0;
+    if (weeklyTarget && weeklyTarget.targetCount > 0) {
+      const weekRange = getWeekRange(currentWeek);
+      currentCount = await GoldLog.countDocuments({
+        userId: userId,
+        createTime: {
+          $gte: weekRange.start,
+          $lt: weekRange.end
+        }
+      });
+    }
     
     // 构建返回数据
     const responseData = {
       ...userGold.toObject(),
-      todayTarget: dailyTarget ? dailyTarget.target : 0,
-      bonusGold: dailyTarget ? dailyTarget.bonusGold : 0,
+      weeklyTarget: weeklyTarget ? weeklyTarget.targetCount : 0,
+      currentCount: currentCount,
+      bonusGold: weeklyTarget ? weeklyTarget.bonusGold : 0,
       hasClaimedBonus: hasClaimedBonus
     };
     

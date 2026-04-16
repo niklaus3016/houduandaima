@@ -2,10 +2,10 @@ const OSS = require('ali-oss');
 
 // 创建OSS客户端
 const client = new OSS({
-  region: process.env.OSS_REGION || 'oss-cn-hangzhou',
-  accessKeyId: process.env.OSS_ACCESS_KEY_ID || 'your-access-key-id',
-  accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET || 'your-access-key-secret',
-  bucket: process.env.OSS_BUCKET || 'your-bucket-name'
+  region: 'oss-cn-hangzhou',
+  accessKeyId: 'LTAI5tFowdyxZZAuvkDDbJFF',
+  accessKeySecret: 'zoUy94ddKAcJy9lLuSxNeDXyXfM3oq',
+  bucket: 'yinsiurl'
 });
 
 /**

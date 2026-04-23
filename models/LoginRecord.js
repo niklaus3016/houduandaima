@@ -26,4 +26,7 @@ const loginRecordSchema = new mongoose.Schema({
 // 复合索引，确保每天只记录一次
 loginRecordSchema.index({ userId: 1, loginDate: 1 }, { unique: true });
 
+// 优化loginDate+employeeId查询性能
+loginRecordSchema.index({ loginDate: 1, employeeId: 1 });
+
 module.exports = mongoose.model('LoginRecord', loginRecordSchema);

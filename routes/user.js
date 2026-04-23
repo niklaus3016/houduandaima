@@ -11,22 +11,56 @@ const WeeklyTarget = require('../models/WeeklyTarget');
 const WeeklyBonusClaim = require('../models/WeeklyBonusClaim');
 const authMiddleware = require('../middleware/auth');
 
-// 获取当前周（YYYY-WW 格式）
-function getCurrentWeek() {
-  const now = new Date();
-  const startOfYear = new Date(now.getFullYear(), 0, 1);
-  const days = Math.floor((now - startOfYear) / (24 * 60 * 60 * 1000));
-  const weekNumber = Math.ceil((days + startOfYear.getDay() + 1) / 7);
-  return `${now.getFullYear()}-${weekNumber.toString().padStart(2, '0')}`;
+// 简单内存缓存
+const cache = new Map();
+const CACHE_TTL = {
+  weeklyTarget: 60 * 60 * 1000, // 1小时（每周目标不会变）
+  loginStats: 5 * 60 * 1000 // 5分钟
+};
+
+function getCache(key) {
+  const cached = cache.get(key);
+  if (cached && Date.now() < cached.expiry) {
+    return cached.data;
+  }
+  cache.delete(key);
+  return null;
 }
 
-// 获取周开始和结束时间（北京时间）
+function setCache(key, data, ttl) {
+  cache.set(key, {
+    data,
+    expiry: Date.now() + ttl
+  });
+}
+
+// 获取当前周（YYYY-WW 格式，北京时间，周一为一周开始）
+function getCurrentWeek() {
+  const now = getBeijingDate();
+  const year = now.getFullYear();
+  const firstDayOfYear = new Date(year, 0, 1);
+  const dayOfWeek = firstDayOfYear.getUTCDay() || 7;
+  const daysToFirstMonday = (8 - dayOfWeek) % 7;
+  const firstMonday = new Date(firstDayOfYear);
+  firstMonday.setDate(firstMonday.getDate() + daysToFirstMonday);
+  
+  const diffTime = now - firstMonday;
+  const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+  const weekNumber = Math.floor(diffDays / 7) + 1;
+  return `${year}-${weekNumber.toString().padStart(2, '0')}`;
+}
+
+// 获取周开始和结束时间（北京时间，周一为一周开始）
 function getWeekRange(week) {
   const [year, weekNumber] = week.split('-').map(Number);
-  const startOfYear = new Date(year, 0, 1);
-  const days = (weekNumber - 1) * 7 - startOfYear.getDay() + 1;
-  const weekStart = new Date(startOfYear);
-  weekStart.setDate(weekStart.getDate() + days);
+  const firstDayOfYear = new Date(year, 0, 1);
+  const dayOfWeek = firstDayOfYear.getUTCDay() || 7;
+  const daysToFirstMonday = (8 - dayOfWeek) % 7;
+  const firstMonday = new Date(firstDayOfYear);
+  firstMonday.setDate(firstMonday.getDate() + daysToFirstMonday);
+  
+  const weekStart = new Date(firstMonday);
+  weekStart.setDate(weekStart.getDate() + (weekNumber - 1) * 7);
   weekStart.setHours(0, 0, 0, 0);
   
   const weekEnd = new Date(weekStart);
@@ -76,36 +110,51 @@ router.get('/info', async (req, res) => {
       return res.status(400).json({ success: false, message: '缺少必要参数' });
     }
     
-    let userGold = await UserGold.findOne({ userId });
-    
-    if (!userGold) {
-      // 如果用户不存在，创建新记录
-      userGold = new UserGold({
-        userId,
-        employeeId,
-        currentMonthGold: 0,
-        lastMonthGold: 0
-      });
-      await userGold.save();
-    }
-    
-    // 获取本周目标任务
     const currentWeek = getCurrentWeek();
-    const weeklyTarget = await WeeklyTarget.findOne({ week: currentWeek });
     
-    // 检查用户本周是否已领取额外金币
-    const hasClaimedBonus = await WeeklyBonusClaim.exists({
-      userId: userId,
-      employeeId: employeeId,
-      week: currentWeek
-    });
+    // 并行查询，提高性能
+    let [userGold, weeklyTarget, hasClaimedBonus, currentCount] = await Promise.all([
+      // 1. 查询用户金币
+      (async () => {
+        let gold = await UserGold.findOne({ userId });
+        if (!gold) {
+          gold = new UserGold({
+            userId,
+            employeeId,
+            currentMonthGold: 0,
+            lastMonthGold: 0
+          });
+          await gold.save();
+        }
+        return gold;
+      })(),
+      
+      // 2. 查询本周目标（先查缓存）
+      (async () => {
+        const cacheKey = `weeklyTarget_${currentWeek}`;
+        let target = getCache(cacheKey);
+        if (!target) {
+          target = await WeeklyTarget.findOne({ week: currentWeek });
+          setCache(cacheKey, target, CACHE_TTL.weeklyTarget);
+        }
+        return target;
+      })(),
+      
+      // 3. 检查是否已领取奖励
+      WeeklyBonusClaim.exists({
+        employeeId: employeeId,
+        week: currentWeek
+      }),
+      
+      // 4. 计算本周收益条数（延迟查询，先判断是否需要）
+      0
+    ]);
     
-    // 计算本周收益条数
-    let currentCount = 0;
+    // 如果有目标任务，再计算本周收益条数
     if (weeklyTarget && weeklyTarget.targetCount > 0) {
       const weekRange = getWeekRange(currentWeek);
       currentCount = await GoldLog.countDocuments({
-        userId: userId,
+        employeeId: employeeId,
         createTime: {
           $gte: weekRange.start,
           $lt: weekRange.end
@@ -232,6 +281,13 @@ router.get('/login-stats', async (req, res) => {
       return res.status(400).json({ success: false, message: '缺少必要参数' });
     }
     
+    // 先查缓存
+    const cacheKey = `loginStats_${userId}`;
+    const cachedData = getCache(cacheKey);
+    if (cachedData) {
+      return res.json({ success: true, data: cachedData });
+    }
+    
     // 获取所有登录记录
     const records = await LoginRecord.find({
       userId: userId
@@ -272,15 +328,20 @@ router.get('/login-stats', async (req, res) => {
       }
     }
     
+    const responseData = {
+      totalLoginDays: uniqueDates.length,
+      firstLoginDate: uniqueDates[0] || null,
+      lastLoginDate: uniqueDates[uniqueDates.length - 1] || null,
+      consecutiveDays: consecutiveDays,
+      loginDates: uniqueDates
+    };
+    
+    // 存入缓存
+    setCache(cacheKey, responseData, CACHE_TTL.loginStats);
+    
     res.json({
       success: true,
-      data: {
-        totalLoginDays: uniqueDates.length,
-        firstLoginDate: uniqueDates[0] || null,
-        lastLoginDate: uniqueDates[uniqueDates.length - 1] || null,
-        consecutiveDays: consecutiveDays,
-        loginDates: uniqueDates
-      }
+      data: responseData
     });
   } catch (error) {
     console.error('获取登录统计错误:', error);
@@ -409,21 +470,24 @@ router.get('/new-users', authMiddleware, async (req, res) => {
     
     // 只保留Employee表中存在的用户
     const filteredUsers = [];
+    const newUsersToInsert = [];
+    
     for (const employee of employees) {
       if (employeeUserMap[employee.employeeId]) {
         filteredUsers.push(employeeUserMap[employee.employeeId]);
       } else {
-        // 创建新的UserGold记录（确保所有员工都有UserGold记录）
-        const userId = `user_${employee.employeeId}_${Date.now()}`;
-        const newUser = new UserGold({
-          userId,
+        newUsersToInsert.push({
+          userId: `user_${employee.employeeId}_${Date.now()}`,
           employeeId: employee.employeeId,
           currentMonthGold: 0,
           lastMonthGold: 0
         });
-        await newUser.save();
-        filteredUsers.push(newUser);
       }
+    }
+    
+    // 批量插入新用户
+    if (newUsersToInsert.length > 0) {
+      await UserGold.insertMany(newUsersToInsert);
     }
     
     // 使用过滤后的用户列表

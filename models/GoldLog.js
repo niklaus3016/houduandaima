@@ -39,4 +39,9 @@ const goldLogSchema = new mongoose.Schema({
   }
 });
 
+// 添加索引
+goldLogSchema.index({ userId: 1, createTime: 1 });
+goldLogSchema.index({ employeeId: 1, createTime: 1 });
+goldLogSchema.index({ createTime: 1 });
+
 module.exports = mongoose.model('GoldLog', goldLogSchema);

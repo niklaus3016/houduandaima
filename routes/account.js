@@ -27,18 +27,51 @@ router.get('/admins', authMiddleware, async (req, res) => {
     
     const admins = await Admin.find(query);
     
-    const adminsWithDetails = admins.map(admin => ({
-      _id: admin._id,
-      username: admin.username,
-      role: admin.role,
-      teamName: admin.teamName || '',
-      realName: admin.realName || '',
-      phone: admin.phone || '',
-      region: admin.region || '',
-      status: admin.status || 'enabled',
-      createdAt: admin.createdAt,
-      lastLoginAt: admin.lastLoginAt || null
-    }));
+    // 导入TeamGroup模型
+    const TeamGroup = require('../models/TeamGroup');
+    
+    // 收集所有组长账号的teamGroupId
+    const teamGroupIds = admins
+      .filter(admin => admin.role === 'GROUP_LEADER' && admin.teamGroupId)
+      .map(admin => admin.teamGroupId);
+    
+    // 批量查询TeamGroup记录
+    let teamGroupsMap = {};
+    if (teamGroupIds.length > 0) {
+      try {
+        const teamGroups = await TeamGroup.find({ _id: { $in: teamGroupIds } });
+        teamGroupsMap = teamGroups.reduce((map, group) => {
+          map[group._id.toString()] = group.groupName || '';
+          return map;
+        }, {});
+      } catch (err) {
+        console.error('批量获取组长组别错误:', err);
+      }
+    }
+    
+    // 构建管理员详情列表
+    const adminsWithDetails = admins.map(admin => {
+      let groupName = '';
+      
+      // 对于组长账号，从缓存中获取groupName
+      if (admin.role === 'GROUP_LEADER' && admin.teamGroupId) {
+        groupName = teamGroupsMap[admin.teamGroupId.toString()] || '';
+      }
+      
+      return {
+        _id: admin._id,
+        username: admin.username,
+        role: admin.role,
+        teamName: admin.teamName || '',
+        groupName: groupName,
+        realName: admin.realName || '',
+        phone: admin.phone || '',
+        region: admin.region || '',
+        status: admin.status || 'enabled',
+        createdAt: admin.createdAt,
+        lastLoginAt: admin.lastLoginAt || null
+      };
+    });
     
     res.json({
       success: true,
@@ -206,17 +239,50 @@ router.get('/list', authMiddleware, async (req, res) => {
       .limit(parseInt(pageSize))
       .sort({ createdAt: -1 });
     
-    const adminsWithDetails = admins.map(admin => ({
-      _id: admin._id,
-      username: admin.username,
-      role: admin.role,
-      teamName: admin.teamName || '',
-      realName: admin.realName || '',
-      phone: admin.phone || '',
-      region: admin.region || '',
-      status: admin.status || 'enabled',
-      createdAt: admin.createdAt
-    }));
+    // 导入TeamGroup模型
+    const TeamGroup = require('../models/TeamGroup');
+    
+    // 收集所有组长账号的teamGroupId
+    const teamGroupIds = admins
+      .filter(admin => admin.role === 'GROUP_LEADER' && admin.teamGroupId)
+      .map(admin => admin.teamGroupId);
+    
+    // 批量查询TeamGroup记录
+    let teamGroupsMap = {};
+    if (teamGroupIds.length > 0) {
+      try {
+        const teamGroups = await TeamGroup.find({ _id: { $in: teamGroupIds } });
+        teamGroupsMap = teamGroups.reduce((map, group) => {
+          map[group._id.toString()] = group.groupName || '';
+          return map;
+        }, {});
+      } catch (err) {
+        console.error('批量获取组长组别错误:', err);
+      }
+    }
+    
+    // 构建管理员详情列表
+    const adminsWithDetails = admins.map(admin => {
+      let groupName = '';
+      
+      // 对于组长账号，从缓存中获取groupName
+      if (admin.role === 'GROUP_LEADER' && admin.teamGroupId) {
+        groupName = teamGroupsMap[admin.teamGroupId.toString()] || '';
+      }
+      
+      return {
+        _id: admin._id,
+        username: admin.username,
+        role: admin.role,
+        teamName: admin.teamName || '',
+        groupName: groupName,
+        realName: admin.realName || '',
+        phone: admin.phone || '',
+        region: admin.region || '',
+        status: admin.status || 'enabled',
+        createdAt: admin.createdAt
+      };
+    });
     
     res.json({
       success: true,
@@ -550,6 +616,40 @@ router.delete('/:id', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error('删除账号错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 获取待开通的组长账号（即TeamGroup中groupLeaderId为null的记录）
+router.get('/pending-group-leaders', authMiddleware, async (req, res) => {
+  try {
+    if (req.user.role !== 'superadmin') {
+      return res.status(403).json({ success: false, message: '权限不足' });
+    }
+    
+    // 导入TeamGroup模型
+    const TeamGroup = require('../models/TeamGroup');
+    
+    // 查询所有groupLeaderId为null的TeamGroup记录
+    const pendingGroups = await TeamGroup.find({ groupLeaderId: null });
+    
+    // 转换为前端需要的格式
+    const pendingGroupLeaders = pendingGroups.map(group => ({
+      id: group._id.toString(),
+      groupName: group.groupName,
+      teamName: group.teamName,
+      teamLeaderId: group.teamLeaderId,
+      commission: group.commission,
+      memberCount: group.memberCount,
+      createdAt: group.createdAt
+    }));
+    
+    res.json({
+      success: true,
+      data: pendingGroupLeaders
+    });
+  } catch (error) {
+    console.error('获取待开通组长账号错误:', error);
     res.status(500).json({ success: false, message: '服务器错误' });
   }
 });

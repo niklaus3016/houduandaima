@@ -13,22 +13,33 @@ function getBeijingDate() {
   return new Date(now.getTime() + 8 * 60 * 60 * 1000);
 }
 
-// 获取当前周（YYYY-WW 格式，北京时间）
+// 获取当前周（YYYY-WW 格式，北京时间，周一为一周开始）
 function getCurrentWeek() {
   const now = getBeijingDate();
-  const startOfYear = new Date(now.getFullYear(), 0, 1);
-  const days = Math.floor((now - startOfYear) / (24 * 60 * 60 * 1000));
-  const weekNumber = Math.ceil((days + startOfYear.getDay() + 1) / 7);
-  return `${now.getFullYear()}-${weekNumber.toString().padStart(2, '0')}`;
+  const year = now.getFullYear();
+  const firstDayOfYear = new Date(year, 0, 1);
+  const dayOfWeek = firstDayOfYear.getUTCDay() || 7;
+  const daysToFirstMonday = (8 - dayOfWeek) % 7;
+  const firstMonday = new Date(firstDayOfYear);
+  firstMonday.setDate(firstMonday.getDate() + daysToFirstMonday);
+  
+  const diffTime = now - firstMonday;
+  const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+  const weekNumber = Math.floor(diffDays / 7) + 1;
+  return `${year}-${weekNumber.toString().padStart(2, '0')}`;
 }
 
-// 获取周开始和结束时间（北京时间）
+// 获取周开始和结束时间（北京时间，周一为一周开始）
 function getWeekRange(week) {
   const [year, weekNumber] = week.split('-').map(Number);
-  const startOfYear = new Date(year, 0, 1);
-  const days = (weekNumber - 1) * 7 - startOfYear.getDay() + 1;
-  const weekStart = new Date(startOfYear);
-  weekStart.setDate(weekStart.getDate() + days);
+  const firstDayOfYear = new Date(year, 0, 1);
+  const dayOfWeek = firstDayOfYear.getUTCDay() || 7;
+  const daysToFirstMonday = (8 - dayOfWeek) % 7;
+  const firstMonday = new Date(firstDayOfYear);
+  firstMonday.setDate(firstMonday.getDate() + daysToFirstMonday);
+  
+  const weekStart = new Date(firstMonday);
+  weekStart.setDate(weekStart.getDate() + (weekNumber - 1) * 7);
   weekStart.setHours(0, 0, 0, 0);
   
   const weekEnd = new Date(weekStart);

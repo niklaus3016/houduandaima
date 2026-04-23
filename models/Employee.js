@@ -57,4 +57,9 @@ const employeeSchema = new mongoose.Schema({
   }
 });
 
+// 添加索引
+employeeSchema.index({ parentId: 1 });
+employeeSchema.index({ teamGroupId: 1 });
+employeeSchema.index({ employeeId: 1 });
+
 module.exports = mongoose.model('Employee', employeeSchema);

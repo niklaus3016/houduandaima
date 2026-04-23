@@ -35,4 +35,8 @@ const teamGroupSchema = new mongoose.Schema({
   }
 });
 
+// 添加索引
+teamGroupSchema.index({ teamName: 1 });
+teamGroupSchema.index({ teamLeaderId: 1 });
+
 module.exports = mongoose.model('TeamGroup', teamGroupSchema);

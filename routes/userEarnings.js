@@ -39,10 +39,42 @@ router.get('/:userId/earnings', authMiddleware, async (req, res) => {
     
     const employeeId = userGold.employeeId;
     
-    // 获取用户所有金币记录
-    const allGoldLogs = await GoldLog.find({ userId }).sort({ createTime: 1 });
+    // 用聚合查询一次性统计，避免拉取所有记录
+    const aggregateResults = await GoldLog.aggregate([
+      {
+        $match: { userId }
+      },
+      {
+        $project: {
+          createTime: 1,
+          gold: 1,
+          // 添加北京时间字段
+          beijingDate: {
+            $add: ['$createTime', 8 * 60 * 60 * 1000]
+          }
+        }
+      },
+      {
+        $group: {
+          _id: {
+            year: { $year: '$beijingDate' },
+            month: { $month: '$beijingDate' },
+            day: { $dayOfMonth: '$beijingDate' }
+          },
+          totalGold: { $sum: '$gold' },
+          watched: { $sum: 1 }
+        }
+      },
+      {
+        $sort: {
+          '_id.year': 1,
+          '_id.month': 1,
+          '_id.day': 1
+        }
+      }
+    ]);
     
-    if (allGoldLogs.length === 0) {
+    if (aggregateResults.length === 0) {
       return res.json({
         success: true,
         data: {
@@ -58,39 +90,33 @@ router.get('/:userId/earnings', authMiddleware, async (req, res) => {
       });
     }
     
-    // 计算总收益（所有金币 / 1000）
-    const totalGold = allGoldLogs.reduce((sum, log) => sum + log.gold, 0);
-    const totalEarnings = parseFloat((totalGold / 1000).toFixed(2));
-    
-    // 按月份分组
+    // 整理聚合结果
     const monthlyData = {};
-    allGoldLogs.forEach(log => {
-      const beijingDate = getBeijingDate(log.createTime);
-      const year = beijingDate.getUTCFullYear();
-      const month = beijingDate.getUTCMonth();
-      const day = beijingDate.getUTCDate();
-      const monthKey = `${year}-${String(month + 1).padStart(2, '0')}`;
+    let totalGold = 0;
+    
+    aggregateResults.forEach(result => {
+      const { year, month, day } = result._id;
+      const monthKey = `${year}-${String(month).padStart(2, '0')}`;
       const dayKey = `${monthKey}-${String(day).padStart(2, '0')}`;
+      
+      totalGold += result.totalGold;
       
       if (!monthlyData[monthKey]) {
         monthlyData[monthKey] = {
           year,
-          month: month + 1,
+          month,
           days: {}
         };
       }
       
-      if (!monthlyData[monthKey].days[dayKey]) {
-        monthlyData[monthKey].days[dayKey] = {
-          date: dayKey,
-          earnings: 0,
-          watched: 0
-        };
-      }
-      
-      monthlyData[monthKey].days[dayKey].earnings += log.gold / 1000;
-      monthlyData[monthKey].days[dayKey].watched += 1;
+      monthlyData[monthKey].days[dayKey] = {
+        date: dayKey,
+        earnings: result.totalGold / 1000,
+        watched: result.watched
+      };
     });
+    
+    const totalEarnings = parseFloat((totalGold / 1000).toFixed(2));
     
     // 获取当前月份
     const now = new Date();

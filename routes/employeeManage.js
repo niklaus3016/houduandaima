@@ -1,11 +1,29 @@
 const express = require('express');
 const router = express.Router();
+const mongoose = require('mongoose');
 const Employee = require('../models/Employee');
 const UserGold = require('../models/UserGold');
 const Admin = require('../models/Admin');
 const TeamGroup = require('../models/TeamGroup');
 const GoldLog = require('../models/GoldLog');
 const authMiddleware = require('../middleware/auth');
+const { cache, CACHE_TTL, get, set, clear } = require('../utils/cache');
+
+const LOCAL_CACHE_TTL = CACHE_TTL.employee_list;
+
+function getCacheKey(teamId) {
+  return `employee_list_${teamId}`;
+}
+
+function setCache(teamId, data) {
+  const cacheKey = getCacheKey(teamId);
+  set(cacheKey, data, LOCAL_CACHE_TTL);
+}
+
+function getCache(teamId) {
+  const cacheKey = getCacheKey(teamId);
+  return get(cacheKey);
+}
 
 function getBeijingDate(date = new Date()) {
   return new Date(date.getTime() + 8 * 60 * 60 * 1000);
@@ -94,6 +112,11 @@ router.post('/create', authMiddleware, async (req, res) => {
       lastMonthGold: 0
     });
     await newUserGold.save();
+
+    // 清除相关缓存
+    clear('employee_list_');
+    clear('team_leaders_');
+    clear('group_leaders_');
     
     res.json({
       success: true,
@@ -135,16 +158,34 @@ router.get('/list', authMiddleware, async (req, res) => {
       query.parentId = parentId;
     }
     
+    const cacheKey = `employee_list_all_${search || 'none'}_${page}_${pageSize}_${parentId || 'none'}`;
+    const cached = cache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < 10 * 60 * 1000) {
+      return res.json({
+        success: true,
+        data: cached.data,
+        pagination: cached.pagination
+      });
+    }
+    
     const total = await Employee.countDocuments(query);
     const employees = await Employee.find(query)
       .skip((page - 1) * pageSize)
       .limit(parseInt(pageSize))
       .sort({ createdAt: -1 });
     
-    const employeesWithDetails = await Promise.all(employees.map(async (emp) => {
+    // 优化：批量查询所有相关的Admin
+    const parentIds = [...new Set(employees.map(emp => emp.parentId).filter(id => id))];
+    const admins = parentIds.length > 0 ? await Admin.find({ _id: { $in: parentIds } }) : [];
+    const adminById = {};
+    admins.forEach(admin => {
+      adminById[admin._id.toString()] = admin;
+    });
+    
+    const employeesWithDetails = employees.map(emp => {
       let parentName = '系统直属';
       if (emp.parentId) {
-        const parent = await Admin.findById(emp.parentId);
+        const parent = adminById[emp.parentId.toString()];
         if (parent) {
           parentName = parent.teamName || parent.realName || parent.username;
         }
@@ -166,16 +207,27 @@ router.get('/list', authMiddleware, async (req, res) => {
         joinedGroupAt: emp.joinedGroupAt || null,
         createdAt: emp.createdAt
       };
-    }));
+    });
     
-    res.json({
-      success: true,
+    const result = {
       data: employeesWithDetails,
       pagination: {
         total,
         page: parseInt(page),
         pageSize: parseInt(pageSize)
       }
+    };
+    
+    // 缓存结果，10分钟过期
+    cache.set(cacheKey, {
+      data: result.data,
+      pagination: result.pagination,
+      timestamp: Date.now()
+    });
+    
+    res.json({
+      success: true,
+      ...result
     });
   } catch (error) {
     console.error('获取员工列表错误:', error);
@@ -212,20 +264,23 @@ router.put('/:id', authMiddleware, async (req, res) => {
     if (region !== undefined) employee.region = region;
     
     // 处理组分配，记录入组时间
-    if (teamGroupId !== undefined || groupId !== undefined) {
-      const newTeamGroupId = teamGroupId || groupId; // 兼容前端传递的groupId
-      if (newTeamGroupId && newTeamGroupId !== employee.teamGroupId) {
-        // 分配新组或转移组，更新入组时间
-        employee.joinedGroupAt = new Date();
-      }
+    const newTeamGroupId = teamGroupId || groupId;
+    if (newTeamGroupId && newTeamGroupId !== String(employee.teamGroupId)) {
+      // 分配新组或转移组，更新入组时间
+      employee.joinedGroupAt = new Date();
       employee.teamGroupId = newTeamGroupId;
     }
     
-    if (groupName !== undefined) employee.groupName = groupName;
+    if (groupName !== undefined && groupName !== '') employee.groupName = groupName;
     if (req.body.phoneCount !== undefined) employee.phoneCount = req.body.phoneCount;
     
     employee.updatedAt = new Date();
     await employee.save();
+
+    // 清除相关缓存
+    clear('employee_list_');
+    clear('team_leaders_');
+    clear('group_leaders_');
     
     res.json({
       success: true,
@@ -266,6 +321,11 @@ router.put('/:id/status', authMiddleware, async (req, res) => {
     employee.status = status;
     employee.updatedAt = new Date();
     await employee.save();
+
+    // 清除相关缓存
+    clear('employee_list_');
+    clear('team_leaders_');
+    clear('group_leaders_');
     
     res.json({
       success: true,
@@ -290,6 +350,11 @@ router.delete('/:id', authMiddleware, async (req, res) => {
     if (!employee) {
       return res.status(404).json({ success: false, message: '员工不存在' });
     }
+
+    // 清除相关缓存
+    clear('employee_list_');
+    clear('team_leaders_');
+    clear('group_leaders_');
     
     res.json({
       success: true,
@@ -304,22 +369,44 @@ router.delete('/:id', authMiddleware, async (req, res) => {
 // 获取团队长列表（用于下拉选择）
 router.get('/team-leaders', authMiddleware, async (req, res) => {
   try {
+    const cacheKey = 'team_leaders_list';
+    const cached = cache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < 10 * 60 * 1000) {
+      return res.json({
+        success: true,
+        data: cached.data
+      });
+    }
+    
     const admins = await Admin.find({ status: 'enabled' })
       .select('_id teamName realName username')
       .sort({ teamName: 1 });
     
-    const leaders = await Promise.all(admins.map(async (admin) => {
-      // 计算团队成员数量
-      const memberCount = await Employee.countDocuments({ parentId: admin._id });
-      
-      return {
-        _id: admin._id,
-        username: admin.username,
-        realName: admin.realName || admin.username,
-        teamName: admin.teamName || '',
-        memberCount: memberCount
-      };
+    // 优化：批量查询所有团队的成员数量
+    const adminIds = admins.map(admin => admin._id);
+    const employeeCounts = await Employee.aggregate([
+      { $match: { parentId: { $in: adminIds } } },
+      { $group: { _id: '$parentId', count: { $sum: 1 } } }
+    ]);
+    
+    const countByAdminId = {};
+    employeeCounts.forEach(item => {
+      countByAdminId[item._id.toString()] = item.count;
+    });
+    
+    const leaders = admins.map(admin => ({
+      _id: admin._id,
+      username: admin.username,
+      realName: admin.realName || admin.username,
+      teamName: admin.teamName || '',
+      memberCount: countByAdminId[admin._id.toString()] || 0
     }));
+    
+    // 缓存结果，10分钟过期
+    cache.set(cacheKey, {
+      data: leaders,
+      timestamp: Date.now()
+    });
     
     res.json({
       success: true,
@@ -334,13 +421,25 @@ router.get('/team-leaders', authMiddleware, async (req, res) => {
 // 获取团队下组长列表
 router.get('/group-leaders', authMiddleware, async (req, res) => {
   try {
-    const { teamId } = req.query;
+    const { teamId, includeEmployees, includeStats, page, pageSize } = req.query;
     
     if (!teamId) {
       return res.status(400).json({ success: false, message: '缺少团队ID参数' });
     }
     
     const groups = await TeamGroup.find({ teamLeaderId: teamId });
+    const groupIds = groups.map(g => g._id);
+    
+    const allEmployees = await Employee.find({ teamGroupId: { $in: groupIds } });
+    const employeesByGroup = {};
+    allEmployees.forEach(emp => {
+      if (!employeesByGroup[emp.teamGroupId]) {
+        employeesByGroup[emp.teamGroupId] = [];
+      }
+      employeesByGroup[emp.teamGroupId].push(emp);
+    });
+    
+    const allEmployeeIds = allEmployees.map(e => e.employeeId);
     
     const now = new Date();
     const todayStart = getBeijingStartOfDay(now);
@@ -352,36 +451,53 @@ router.get('/group-leaders', authMiddleware, async (req, res) => {
     
     const monthStart = getMonthStart(now);
     
-    const groupLeaders = await Promise.all(groups.map(async (group) => {
-      const employees = await Employee.find({ teamGroupId: group._id });
-      const employeeIds = employees.map(e => e.employeeId);
+    const weekStart = new Date(now);
+    const dayOfWeek = weekStart.getUTCDay() || 7;
+    const daysToMonday = dayOfWeek - 1;
+    weekStart.setDate(weekStart.getDate() - daysToMonday);
+    weekStart.setHours(0, 0, 0, 0);
+    
+    const [todayGoldLogs, yesterdayGoldLogs, monthGoldLogs, weekGoldLogs] = await Promise.all([
+      GoldLog.find({ employeeId: { $in: allEmployeeIds }, createTime: { $gte: todayStart, $lte: todayEnd } }),
+      GoldLog.find({ employeeId: { $in: allEmployeeIds }, createTime: { $gte: yesterdayStart, $lte: yesterdayEnd } }),
+      GoldLog.find({ employeeId: { $in: allEmployeeIds }, createTime: { $gte: monthStart } }),
+      GoldLog.find({ employeeId: { $in: allEmployeeIds }, createTime: { $gte: weekStart } })
+    ]);
+    
+    const todayStatsByEmployee = {};
+    todayGoldLogs.forEach(log => {
+      if (!todayStatsByEmployee[log.employeeId]) {
+        todayStatsByEmployee[log.employeeId] = { gold: 0, ecpm: 0, count: 0 };
+      }
+      todayStatsByEmployee[log.employeeId].gold += log.gold;
+      todayStatsByEmployee[log.employeeId].ecpm += log.ecpm || 0;
+      todayStatsByEmployee[log.employeeId].count += 1;
+    });
+    
+    const statsByGroup = {};
+    groups.forEach(g => {
+      const empIds = (employeesByGroup[g._id] || []).map(e => e.employeeId);
+      const todayLogs = todayGoldLogs.filter(l => empIds.includes(l.employeeId));
+      const yesterdayLogs = yesterdayGoldLogs.filter(l => empIds.includes(l.employeeId));
+      const monthLogs = monthGoldLogs.filter(l => empIds.includes(l.employeeId));
+      const weekLogs = weekGoldLogs.filter(l => empIds.includes(l.employeeId));
       
-      const todayGoldLogs = await GoldLog.find({
-        employeeId: { $in: employeeIds },
-        createTime: { $gte: todayStart, $lte: todayEnd }
-      });
+      const todayActive = new Set(todayLogs.map(l => l.employeeId)).size;
+      const todayRevenue = todayLogs.reduce((sum, l) => sum + l.gold, 0) / 1000;
+      const yesterdayRevenue = yesterdayLogs.reduce((sum, l) => sum + l.gold, 0) / 1000;
+      const monthlyRevenue = monthLogs.reduce((sum, l) => sum + l.gold, 0) / 1000;
+      const weeklyRevenue = weekLogs.reduce((sum, l) => sum + l.gold, 0) / 1000;
+      const todayAdCount = todayLogs.length;
+      const avgEcpm = todayAdCount > 0 ? todayLogs.reduce((sum, l) => sum + (l.ecpm || 0), 0) / todayAdCount : 0;
       
-      const yesterdayGoldLogs = await GoldLog.find({
-        employeeId: { $in: employeeIds },
-        createTime: { $gte: yesterdayStart, $lte: yesterdayEnd }
-      });
-      
-      const monthGoldLogs = await GoldLog.find({
-        employeeId: { $in: employeeIds },
-        createTime: { $gte: monthStart }
-      });
-      
-      const todayActiveSet = new Set(todayGoldLogs.map(log => log.employeeId));
-      const todayActive = todayActiveSet.size;
-      
-      const todayRevenue = todayGoldLogs.reduce((sum, log) => sum + log.gold, 0) / 1000;
-      const yesterdayRevenue = yesterdayGoldLogs.reduce((sum, log) => sum + log.gold, 0) / 1000;
-      const monthlyRevenue = monthGoldLogs.reduce((sum, log) => sum + log.gold, 0) / 1000;
-      
-      const todayAdCount = todayGoldLogs.length;
-      
-      const totalEcpm = todayGoldLogs.reduce((sum, log) => sum + (log.ecpm || 0), 0);
-      const avgEcpm = todayAdCount > 0 ? totalEcpm / todayAdCount : 0;
+      statsByGroup[g._id.toString()] = {
+        todayActive, todayRevenue, yesterdayRevenue, weeklyRevenue, monthlyRevenue, todayAdCount, avgEcpm
+      };
+    });
+    
+    const groupLeaders = groups.map(group => {
+      const employees = employeesByGroup[group._id] || [];
+      const stats = statsByGroup[group._id.toString()] || {};
       
       return {
         _id: group._id,
@@ -391,18 +507,59 @@ router.get('/group-leaders', authMiddleware, async (req, res) => {
         groupLeaderName: group.groupLeaderName,
         commission: group.commission,
         memberCount: group.memberCount || employees.length,
-        todayActive,
-        todayRevenue: parseFloat(todayRevenue.toFixed(2)),
-        monthlyRevenue: parseFloat(monthlyRevenue.toFixed(2)),
-        todayAdCount,
-        avgEcpm: parseFloat(avgEcpm.toFixed(2)),
-        yesterdayRevenue: parseFloat(yesterdayRevenue.toFixed(2))
+        todayActive: stats.todayActive || 0,
+        todayRevenue: parseFloat((stats.todayRevenue || 0).toFixed(2)),
+        weeklyRevenue: parseFloat((stats.weeklyRevenue || 0).toFixed(2)),
+        monthlyRevenue: parseFloat((stats.monthlyRevenue || 0).toFixed(2)),
+        todayAdCount: stats.todayAdCount || 0,
+        avgEcpm: parseFloat((stats.avgEcpm || 0).toFixed(2)),
+        yesterdayRevenue: parseFloat((stats.yesterdayRevenue || 0).toFixed(2)),
+        ...(includeEmployees === 'true' || includeEmployees === true ? {
+          employees: employees.map(emp => ({
+            _id: emp._id,
+            employeeId: emp.employeeId,
+            realName: emp.realName,
+            phone: emp.phone,
+            region: emp.region,
+            status: emp.status,
+            todayActive: todayStatsByEmployee[emp.employeeId] ? 1 : 0,
+            todayRevenue: parseFloat(((todayStatsByEmployee[emp.employeeId]?.gold || 0) / 1000).toFixed(2)),
+            todayAdCount: todayStatsByEmployee[emp.employeeId]?.count || 0
+          }))
+        } : {})
       };
-    }));
+    });
+    
+    const teamStats = includeStats === 'true' || includeStats === true ? {
+      totalGroups: groups.length,
+      totalEmployees: allEmployees.length,
+      activeEmployees: new Set(todayGoldLogs.map(l => l.employeeId)).size,
+      todayRevenue: parseFloat((Object.values(statsByGroup).reduce((sum, s) => sum + (s.todayRevenue || 0), 0)).toFixed(2)),
+      weeklyRevenue: parseFloat((Object.values(statsByGroup).reduce((sum, s) => sum + (s.weeklyRevenue || 0), 0)).toFixed(2)),
+      monthlyRevenue: parseFloat((Object.values(statsByGroup).reduce((sum, s) => sum + (s.monthlyRevenue || 0), 0)).toFixed(2)),
+      groupLeaderRevenue: parseFloat((groups.reduce((sum, g) => {
+        const stats = statsByGroup[g._id.toString()];
+        return sum + (stats?.todayRevenue || 0) * (g.commission || 0.05);
+      }, 0)).toFixed(2))
+    } : null;
+    
+    let result = groupLeaders;
+    if (page && pageSize) {
+      const pageNum = parseInt(page);
+      const size = parseInt(pageSize);
+      result = groupLeaders.slice((pageNum - 1) * size, pageNum * size);
+    }
     
     res.json({
       success: true,
-      data: groupLeaders
+      data: result,
+      ...(teamStats ? { teamStats } : {}),
+      pagination: page && pageSize ? {
+        total: groupLeaders.length,
+        page: parseInt(page),
+        pageSize: parseInt(pageSize),
+        totalPages: Math.ceil(groupLeaders.length / parseInt(pageSize))
+      } : undefined
     });
   } catch (error) {
     console.error('获取团队下组长列表错误:', error);
@@ -482,7 +639,7 @@ router.put('/group-leader/:id', authMiddleware, async (req, res) => {
     
     if (commission !== undefined) group.commission = commission;
     if (groupLeaderId !== undefined) group.groupLeaderId = groupLeaderId;
-    if (groupLeaderName !== undefined) group.groupLeaderName = groupLeaderName;
+    // 禁止修改groupLeaderName，保持团队长设置的姓名
     
     await group.save();
     
@@ -527,6 +684,413 @@ router.delete('/group-leader/:id', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error('删除组长错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 组长帐号列表接口 - 简化版
+router.get('/group-leaders-simple', authMiddleware, async (req, res) => {
+  try {
+    const { teamId } = req.query;
+
+    if (!teamId) {
+      return res.status(400).json({ success: false, message: '缺少团队ID参数' });
+    }
+
+    const groups = await TeamGroup.find({ teamLeaderId: teamId });
+    const groupIds = groups.map(g => g._id);
+
+    const employees = await Employee.find({ teamGroupId: { $in: groupIds } });
+    const employeeCountByGroup = {};
+    employees.forEach(emp => {
+      if (emp.teamGroupId) {
+        employeeCountByGroup[emp.teamGroupId] = (employeeCountByGroup[emp.teamGroupId] || 0) + 1;
+      }
+    });
+
+    const groupLeaderAdmins = await Admin.find({
+      teamGroupId: { $in: groupIds },
+      role: 'GROUP_LEADER'
+    });
+
+    const adminByGroupId = {};
+    groupLeaderAdmins.forEach(admin => {
+      if (admin.teamGroupId) {
+        adminByGroupId[admin.teamGroupId.toString()] = admin;
+      }
+    });
+
+    const result = groups.map(group => {
+      const admin = adminByGroupId[group._id.toString()];
+      const isOpened = admin && group.groupLeaderId;
+      return {
+        _id: admin ? admin._id.toString() : group._id.toString(),
+        username: isOpened ? admin.username : '',
+        realName: group.groupLeaderName || '',
+        role: 'GROUP_LEADER',
+        status: isOpened ? admin.status : 'disabled',
+        groupName: group.groupName,
+        commission: group.commission || 0.05,
+        memberCount: employeeCountByGroup[group._id.toString()] || 0
+      };
+    });
+
+    res.json({
+      success: true,
+      message: '获取组长列表成功',
+      data: result
+    });
+  } catch (error) {
+    console.error('获取组长列表错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+
+
+// 团队长组情况接口 - 展示团队下各组的业绩数据
+router.get('/team-leader/groups', authMiddleware, async (req, res) => {
+  try {
+    const { teamId, range = 'today' } = req.query;
+    
+    if (!teamId) {
+      return res.status(400).json({ success: false, message: '缺少团队ID参数' });
+    }
+    
+    // 生成缓存键
+    const cacheKey = `team_leader_groups_${teamId}_${range}`;
+    const cachedItem = cache.get(cacheKey);
+    if (cachedItem && Date.now() - cachedItem.timestamp < CACHE_TTL) {
+      return res.json({
+        success: true,
+        message: '获取团队组列表成功（缓存）',
+        data: cachedItem.data.data,
+        totalGroups: cachedItem.data.totalGroups,
+        totalMembers: cachedItem.data.totalMembers,
+        totalRevenue: cachedItem.data.totalRevenue,
+        fromCache: true
+      });
+    }
+    
+    // 获取北京时间
+    const beijingNow = new Date(Date.now() + 8 * 60 * 60 * 1000);
+    let startDate, endDate, yesterdayStart, yesterdayEnd, lastMonthStart;
+    
+    if (range === 'month') {
+      const monthStart = new Date(beijingNow);
+      monthStart.setUTCDate(1);
+      monthStart.setUTCHours(0, 0, 0, 0);
+      startDate = new Date(monthStart.getTime() - 8 * 60 * 60 * 1000);
+      endDate = new Date();
+      
+      const lastMonth = new Date(beijingNow);
+      lastMonth.setUTCMonth(lastMonth.getUTCMonth() - 1);
+      lastMonth.setUTCDate(1);
+      lastMonth.setUTCHours(0, 0, 0, 0);
+      lastMonthStart = new Date(lastMonth.getTime() - 8 * 60 * 60 * 1000);
+    } else {
+      const todayStartBeijing = new Date(beijingNow);
+      todayStartBeijing.setUTCHours(0, 0, 0, 0);
+      startDate = new Date(todayStartBeijing.getTime() - 8 * 60 * 60 * 1000);
+      endDate = new Date();
+      
+      const yesterdayStartBeijing = new Date(beijingNow);
+      yesterdayStartBeijing.setUTCDate(yesterdayStartBeijing.getUTCDate() - 1);
+      yesterdayStartBeijing.setUTCHours(0, 0, 0, 0);
+      yesterdayStart = new Date(yesterdayStartBeijing.getTime() - 8 * 60 * 60 * 1000);
+      
+      const yesterdayEndBeijing = new Date(beijingNow);
+      yesterdayEndBeijing.setUTCHours(0, 0, 0, 0);
+      yesterdayEnd = new Date(yesterdayEndBeijing.getTime() - 8 * 60 * 60 * 1000);
+    }
+    
+    // 获取团队长的所有组
+    const groups = await TeamGroup.find({ teamLeaderId: teamId });
+    const groupIds = groups.map(g => g._id.toString());
+    
+    // 查询有 teamGroupId 的员工（兼容 ObjectId 和 String 两种类型）
+    const allEmployees = await Employee.find({
+      $or: [
+        { teamGroupId: { $in: groupIds } },
+        { teamGroupId: { $in: groupIds.map(id => new mongoose.Types.ObjectId(id)) } }
+      ]
+    });
+    
+    // 根据 groupName 分组
+    const employeesByGroup = {};
+    allEmployees.forEach(emp => {
+      if (emp.groupName) {
+        if (!employeesByGroup[emp.groupName]) {
+          employeesByGroup[emp.groupName] = [];
+        }
+        employeesByGroup[emp.groupName].push(emp);
+      }
+    });
+    
+
+    // 收集所有员工ID
+    const allEmployeeIds = allEmployees.map(e => e.employeeId);
+    
+    // 批量查询当前时间范围的金币记录
+    const currentStats = await GoldLog.aggregate([
+      {
+        $match: {
+          employeeId: { $in: allEmployeeIds },
+          createTime: { $gte: startDate, $lt: endDate }
+        }
+      },
+      {
+        $group: {
+          _id: '$employeeId',
+          totalGold: { $sum: '$gold' },
+          totalAds: { $sum: 1 }
+        }
+      }
+    ]);
+    
+    const statsByEmployee = {};
+    currentStats.forEach(stat => {
+      statsByEmployee[stat._id] = { totalGold: stat.totalGold, totalAds: stat.totalAds };
+    });
+    
+    // 批量查询对比时间范围的金币记录
+    let compareStats = [];
+    if (range === 'today' && yesterdayStart) {
+      compareStats = await GoldLog.aggregate([
+        {
+          $match: {
+            employeeId: { $in: allEmployeeIds },
+            createTime: { $gte: yesterdayStart, $lt: yesterdayEnd }
+          }
+        },
+        {
+          $group: {
+            _id: '$employeeId',
+            totalGold: { $sum: '$gold' }
+          }
+        }
+      ]);
+    } else if (range === 'month' && lastMonthStart) {
+      compareStats = await GoldLog.aggregate([
+        {
+          $match: {
+            employeeId: { $in: allEmployeeIds },
+            createTime: { $gte: lastMonthStart, $lt: startDate }
+          }
+        },
+        {
+          $group: {
+            _id: '$employeeId',
+            totalGold: { $sum: '$gold' }
+          }
+        }
+      ]);
+    }
+    
+    const compareStatsByEmployee = {};
+    compareStats.forEach(stat => {
+      compareStatsByEmployee[stat._id] = stat.totalGold;
+    });
+    
+    // 构建组数据
+    const groupData = groups.map(group => {
+      const employees = employeesByGroup[group.groupName] || [];
+      const memberEmployeeIds = employees.map(e => e.employeeId);
+      
+      let totalGold = 0;
+      let totalAds = 0;
+      let yesterdayGold = 0;
+      
+      memberEmployeeIds.forEach(empId => {
+        const stat = statsByEmployee[empId];
+        if (stat) {
+          totalGold += stat.totalGold;
+          totalAds += stat.totalAds;
+        }
+        const compare = compareStatsByEmployee[empId];
+        if (compare) {
+          yesterdayGold += compare;
+        }
+      });
+      
+      const avgGold = totalAds > 0 ? totalGold / totalAds : 0;
+      let growthRate = 0;
+      if (yesterdayGold > 0) {
+        growthRate = ((totalGold - yesterdayGold) / yesterdayGold) * 100;
+      }
+      
+      return {
+        groupId: group._id.toString(),
+        groupName: group.groupName,
+        groupLeaderName: group.groupLeaderName || '',
+        memberCount: employees.length,
+        totalAds: totalAds,
+        totalRevenue: totalGold / 1000,
+        avgGold: parseFloat(avgGold.toFixed(2)),
+        growthRate: parseFloat(growthRate.toFixed(2)),
+        commission: group.commission || 0.05,
+        createdAt: group.createdAt
+      };
+    });
+    
+    // 按总收益排序
+    groupData.sort((a, b) => b.totalRevenue - a.totalRevenue);
+    
+    // 计算总计数据
+    const totalGroups = groupData.length;
+    const totalMembers = groupData.reduce((sum, group) => sum + group.memberCount, 0);
+    const totalRevenue = groupData.reduce((sum, group) => sum + group.totalRevenue, 0);
+    
+    // 存储缓存
+    const cacheData = {
+      data: groupData,
+      totalGroups: totalGroups,
+      totalMembers: totalMembers,
+      totalRevenue: parseFloat(totalRevenue.toFixed(2))
+    };
+    cache.set(cacheKey, {
+      data: cacheData,
+      timestamp: Date.now()
+    });
+    
+    res.json({
+      success: true,
+      message: '获取团队组列表成功',
+      data: groupData,
+      totalGroups: totalGroups,
+      totalMembers: totalMembers,
+      totalRevenue: parseFloat(totalRevenue.toFixed(2))
+    });
+  } catch (error) {
+    console.error('获取团队组数据错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 员工帐号列表接口 - 简化版
+router.get('/employees-simple', authMiddleware, async (req, res) => {
+  try {
+    const { teamId } = req.query;
+
+    if (!teamId) {
+      return res.status(400).json({ success: false, message: '缺少团队ID参数' });
+    }
+
+    // 检查缓存
+    const cachedData = getCache(teamId);
+    if (cachedData) {
+      return res.json({
+        success: true,
+        message: '获取员工列表成功（缓存）',
+        data: cachedData
+      });
+    }
+
+    // 优化：只查询需要的字段
+    const employees = await Employee.find(
+      { parentId: teamId },
+      { employeeId: 1, realName: 1, status: 1, phone: 1, region: 1, teamGroupId: 1, groupName: 1, parentId: 1, createdAt: 1, _id: 1 }
+    );
+
+    // 优化：批量查询组信息
+    const groupIds = [...new Set(employees.map(e => e.teamGroupId).filter(id => id))];
+    const groups = groupIds.length > 0 ? await TeamGroup.find(
+      { _id: { $in: groupIds } },
+      { _id: 1, groupName: 1, groupLeaderName: 1 }
+    ) : [];
+    const groupById = {};
+    groups.forEach(g => {
+      groupById[g._id.toString()] = g;
+    });
+
+    const teamAdmin = await Admin.findById(teamId, { teamName: 1, _id: 0 });
+    const teamName = teamAdmin ? teamAdmin.teamName : '';
+
+    // 优化：使用并行查询
+    const employeeIds = employees.map(e => e.employeeId);
+    const beijingNow = getBeijingDate();
+    const todayStart = getBeijingStartOfDay(beijingNow);
+    const yesterdayStart = new Date(todayStart);
+    yesterdayStart.setDate(yesterdayStart.getDate() - 1);
+
+    // 优化：使用聚合查询获取每个员工的最近一次金币记录
+    const goldByEmployee = {};
+    
+    if (employeeIds.length > 0) {
+      const recentGoldLogs = await GoldLog.aggregate([
+        {
+          $match: {
+            employeeId: { $in: employeeIds },
+            createTime: { $gte: new Date(yesterdayStart.getTime() - 30 * 24 * 60 * 60 * 1000) }
+          }
+        },
+        {
+          $sort: { employeeId: 1, createTime: -1 }
+        },
+        {
+          $group: {
+            _id: '$employeeId',
+            lastEarningDate: { $first: '$createTime' }
+          }
+        }
+      ]);
+      
+      recentGoldLogs.forEach(log => {
+        const dateKey = new Date(log.lastEarningDate).toISOString().split('T')[0];
+        goldByEmployee[log._id] = dateKey;
+      });
+    }
+
+    const result = employees.map(emp => {
+      const group = emp.teamGroupId ? groupById[emp.teamGroupId.toString()] : null;
+      
+      let zeroEarningsDays = 0;
+      const empId = emp.employeeId;
+      const lastEarningDate = goldByEmployee[empId];
+      
+      const todayStr = todayStart.toISOString().split('T')[0];
+      const createdDateStr = new Date(emp.createdAt).toISOString().split('T')[0];
+      
+      if (createdDateStr === todayStr) {
+        zeroEarningsDays = 0;
+      } else if (lastEarningDate) {
+        const lastDate = new Date(lastEarningDate);
+        const yesterdayDate = new Date(yesterdayStart);
+        const diffTime = yesterdayDate.getTime() - lastDate.getTime();
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        zeroEarningsDays = Math.min(diffDays, 15);
+      } else {
+        zeroEarningsDays = 15;
+      }
+
+      return {
+        _id: emp._id.toString(),
+        username: emp.employeeId,
+        realName: emp.realName || emp.employeeId,
+        role: 'EMPLOYEE',
+        status: emp.status,
+        employeeId: emp.employeeId,
+        phone: emp.phone || '',
+        region: emp.region || '',
+        teamName: teamName,
+        groupName: emp.groupName || '',
+        parentId: emp.parentId,
+        parentName: group ? (group.groupLeaderName || group.groupName) : '',
+        zeroEarningsDays: zeroEarningsDays,
+        createdAt: emp.createdAt
+      };
+    });
+
+    // 缓存结果
+    setCache(teamId, result);
+
+    res.json({
+      success: true,
+      message: '获取员工列表成功',
+      data: result
+    });
+  } catch (error) {
+    console.error('获取员工列表错误:', error);
     res.status(500).json({ success: false, message: '服务器错误' });
   }
 });

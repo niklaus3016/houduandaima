@@ -56,4 +56,7 @@ const adminSchema = new mongoose.Schema({
   }
 });
 
+// 添加索引
+adminSchema.index({ username: 1 });
+
 module.exports = mongoose.model('Admin', adminSchema);

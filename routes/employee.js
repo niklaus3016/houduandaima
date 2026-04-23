@@ -57,7 +57,7 @@ router.post('/check', async (req, res) => {
     
     // 生成token
     const token = generateToken({
-      _id: employee._id,
+      id: employee._id,
       username: employeeId,
       role: employee.role || 'EMPLOYEE'
     });

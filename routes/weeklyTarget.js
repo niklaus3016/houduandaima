@@ -9,37 +9,50 @@ function getBeijingDate() {
   return new Date(now.getTime() + 8 * 60 * 60 * 1000);
 }
 
-// 获取当前周（YYYY-WW 格式，北京时间）
+// 获取当前周（YYYY-WW 格式，北京时间，周一为一周开始）
 function getCurrentWeek() {
   const now = getBeijingDate();
-  const startOfYear = new Date(now.getFullYear(), 0, 1);
-  const days = Math.floor((now - startOfYear) / (24 * 60 * 60 * 1000));
-  const weekNumber = Math.ceil((days + startOfYear.getDay() + 1) / 7);
-  return `${now.getFullYear()}-${weekNumber.toString().padStart(2, '0')}`;
+  const year = now.getFullYear();
+  const firstDayOfYear = new Date(year, 0, 1);
+  const dayOfWeek = firstDayOfYear.getUTCDay() || 7;
+  const daysToFirstMonday = (8 - dayOfWeek) % 7;
+  const firstMonday = new Date(firstDayOfYear);
+  firstMonday.setDate(firstMonday.getDate() + daysToFirstMonday);
+
+  const diffTime = now - firstMonday;
+  const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+  const weekNumber = Math.floor(diffDays / 7) + 1;
+  return `${year}-${weekNumber.toString().padStart(2, '0')}`;
 }
 
-// 获取某月的所有周（北京时间）
+// 获取某月的所有周（北京时间，周一为一周开始）
 function getWeeksInMonth(year, month) {
   const weeks = [];
   const firstDay = new Date(year, month - 1, 1);
   const lastDay = new Date(year, month, 0);
-  
+
   let currentDate = new Date(firstDay);
   while (currentDate <= lastDay) {
-    // 转换为北京时间
     const beijingDate = new Date(currentDate.getTime() + 8 * 60 * 60 * 1000);
-    const startOfYear = new Date(beijingDate.getFullYear(), 0, 1);
-    const days = Math.floor((beijingDate - startOfYear) / (24 * 60 * 60 * 1000));
-    const weekNumber = Math.ceil((days + startOfYear.getDay() + 1) / 7);
-    const week = `${beijingDate.getFullYear()}-${weekNumber.toString().padStart(2, '0')}`;
-    
+    const beijingYear = beijingDate.getFullYear();
+    const firstDayOfYear = new Date(beijingYear, 0, 1);
+    const dayOfWeek = firstDayOfYear.getUTCDay() || 7;
+    const daysToFirstMonday = (8 - dayOfWeek) % 7;
+    const firstMonday = new Date(firstDayOfYear);
+    firstMonday.setDate(firstMonday.getDate() + daysToFirstMonday);
+
+    const diffTime = beijingDate - firstMonday;
+    const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+    const weekNumber = Math.floor(diffDays / 7) + 1;
+    const week = `${beijingYear}-${weekNumber.toString().padStart(2, '0')}`;
+
     if (!weeks.includes(week)) {
       weeks.push(week);
     }
-    
+
     currentDate.setDate(currentDate.getDate() + 1);
   }
-  
+
   return weeks;
 }
 
@@ -107,13 +120,17 @@ router.get('/month', async (req, res) => {
 router.post('/', authMiddleware, async (req, res) => {
   try {
     const { week, targetCount, bonusCoins } = req.body;
-    
+
     if (!week) {
       return res.status(400).json({ success: false, message: '缺少周参数' });
     }
-    
+
+    const [year, weekNum] = week.split('-');
+    const adjustedWeekNum = parseInt(weekNum) - 1;
+    const adjustedWeek = `${year}-${adjustedWeekNum.toString().padStart(2, '0')}`;
+
     const weeklyTarget = await WeeklyTarget.findOneAndUpdate(
-      { week: week },
+      { week: adjustedWeek },
       {
         targetCount: targetCount || 0,
         bonusGold: bonusCoins || 0,
@@ -121,7 +138,7 @@ router.post('/', authMiddleware, async (req, res) => {
       },
       { upsert: true, new: true }
     );
-    
+
     res.json({
       success: true,
       message: '设置成功',

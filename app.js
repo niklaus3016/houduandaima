@@ -27,9 +27,13 @@ const poolRoutes = require('./routes/pool');
 const deviceRoutes = require('./routes/device');
 const lotteryRoutes = require('./routes/lottery');
 const verificationRoutes = require('./routes/verification');
+const teamPerformanceRoutes = require('./routes/teamPerformance');
+const teamMembersRoutes = require('./routes/teamMembers');
 const weeklyTargetRoutes = require('./routes/weeklyTarget');
 const weeklyBonusRoutes = require('./routes/weeklyBonus');
 const welfareRoutes = require('./routes/welfare');
+const rankingRoutes = require('./routes/ranking');
+
 
 const app = express();
 const PORT = process.env.PORT || 3003;
@@ -84,9 +88,18 @@ app.use('/api', verificationRoutes);
 app.use('/api', welfareRoutes);
 app.use('/api/weeklyTarget', weeklyTargetRoutes);
 app.use('/api/weeklyBonus', weeklyBonusRoutes);
+app.use('/api/ranking', rankingRoutes);
+app.use('/api/admin/team-performance', teamPerformanceRoutes);
+app.use('/api/admin/dashboard', teamMembersRoutes);
 
 // 连接MongoDB
-mongoose.connect(MONGODB_URI)
+mongoose.connect(MONGODB_URI, {
+  maxPoolSize: 100,
+  minPoolSize: 10,
+  serverSelectionTimeoutMS: 5000,
+  socketTimeoutMS: 30000,
+  connectTimeoutMS: 5000,
+})
   .then(() => {
     console.log('MongoDB连接成功');
     
@@ -99,6 +112,26 @@ mongoose.connect(MONGODB_URI)
   .catch(err => {
     console.error('MongoDB连接失败:', err);
   });
+
+// 监听MongoDB连接事件
+mongoose.connection.on('connected', () => {
+  console.log('Mongoose连接已建立');
+});
+
+mongoose.connection.on('error', (err) => {
+  console.error('Mongoose连接错误:', err);
+});
+
+mongoose.connection.on('disconnected', () => {
+  console.log('Mongoose连接已断开');
+});
+
+// 进程终止时关闭连接
+process.on('SIGINT', async () => {
+  await mongoose.connection.close();
+  console.log('Mongoose连接通过应用终止已关闭');
+  process.exit(0);
+});
 
 // 健康检查
 app.get('/', (req, res) => {

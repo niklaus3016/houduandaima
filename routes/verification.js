@@ -1,14 +1,18 @@
 const express = require('express');
 const router = express.Router();
+const mongoose = require('mongoose');
 const multer = require('multer');
 const path = require('path');
 const UserGold = require('../models/UserGold');
 const Employee = require('../models/Employee');
 const Admin = require('../models/Admin');
 const Verification = require('../models/Verification');
+const TeamGroup = require('../models/TeamGroup');
+const GoldLog = require('../models/GoldLog');
 const { generateToken, comparePassword } = require('../utils/auth');
 const authMiddleware = require('../middleware/auth');
 const { uploadFile } = require('../services/storage');
+const { get, set, clear } = require('../utils/cache');
 
 // 配置文件上传（临时存储）
 const storage = multer.diskStorage({
@@ -57,6 +61,12 @@ router.post('/auth/login', async (req, res) => {
   try {
     const { employeeId, password } = req.body;
     
+    // 检查数据库连接状态
+    if (mongoose.connection.readyState !== 1) {
+      console.error('数据库未连接，连接状态:', mongoose.connection.readyState);
+      return res.status(503).json({ success: false, message: '服务暂时不可用，请稍后重试' });
+    }
+    
     // 先检查是否为员工
     let user = await Employee.findOne({ employeeId });
     let userType = 'employee';
@@ -95,6 +105,12 @@ router.post('/auth/login', async (req, res) => {
     });
   } catch (error) {
     console.error('登录错误:', error);
+    
+    // 检查是否是数据库连接错误
+    if (error.name === 'MongoNetworkError' || error.message.includes('connection') || error.message.includes('timed out')) {
+      return res.status(503).json({ success: false, message: '服务暂时不可用，请稍后重试' });
+    }
+    
     res.status(500).json({ success: false, message: '服务器错误' });
   }
 });
@@ -564,6 +580,545 @@ router.get('/verification/admin/stats', authMiddleware, financeMiddleware, async
     });
   } catch (error) {
     console.error('获取核销统计错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 获取北京时间（UTC+8）
+function getBeijingDate(date = new Date()) {
+  return new Date(date.getTime() + 8 * 60 * 60 * 1000);
+}
+
+// 获取时间范围
+function getTimeRange(range) {
+  const now = new Date();
+  const beijingNow = getBeijingDate(now);
+  let startTime, endTime;
+
+  if (range === 'today') {
+    // 今天（北京时间）
+    startTime = new Date(beijingNow);
+    startTime.setUTCHours(0, 0, 0, 0);
+    startTime = new Date(startTime.getTime() - 8 * 60 * 60 * 1000);
+    endTime = new Date(startTime);
+    endTime.setUTCDate(endTime.getUTCDate() + 1);
+  } else if (range === 'yesterday') {
+    // 昨天（北京时间）
+    startTime = new Date(beijingNow);
+    startTime.setUTCDate(startTime.getUTCDate() - 1);
+    startTime.setUTCHours(0, 0, 0, 0);
+    startTime = new Date(startTime.getTime() - 8 * 60 * 60 * 1000);
+    endTime = new Date(startTime);
+    endTime.setUTCDate(endTime.getUTCDate() + 1);
+  } else if (range === 'week') {
+    // 本周一（北京时间）
+    const dayOfWeek = beijingNow.getUTCDay();
+    const mondayOffset = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
+    startTime = new Date(beijingNow);
+    startTime.setUTCDate(startTime.getUTCDate() + mondayOffset);
+    startTime.setUTCHours(0, 0, 0, 0);
+    startTime = new Date(startTime.getTime() - 8 * 60 * 60 * 1000);
+    endTime = now;
+  } else if (range === 'month') {
+    // 本月1日（北京时间）
+    startTime = new Date(beijingNow);
+    startTime.setUTCDate(1);
+    startTime.setUTCHours(0, 0, 0, 0);
+    startTime = new Date(startTime.getTime() - 8 * 60 * 60 * 1000);
+    endTime = now;
+  } else {
+    // 默认今天
+    startTime = new Date(beijingNow);
+    startTime.setUTCHours(0, 0, 0, 0);
+    startTime = new Date(startTime.getTime() - 8 * 60 * 60 * 1000);
+    endTime = new Date(startTime);
+    endTime.setUTCDate(endTime.getUTCDate() + 1);
+  }
+
+  return { startTime, endTime };
+}
+
+// 获取多个时间范围的函数
+function getMultipleTimeRanges() {
+  const now = new Date();
+  const beijingNow = getBeijingDate(now);
+  
+  // 今日
+  const todayStart = new Date(beijingNow);
+  todayStart.setUTCHours(0, 0, 0, 0);
+  const todayStartTime = new Date(todayStart.getTime() - 8 * 60 * 60 * 1000);
+  const todayEndTime = new Date(todayStartTime);
+  todayEndTime.setUTCDate(todayEndTime.getUTCDate() + 1);
+  
+  // 本月
+  const monthStart = new Date(beijingNow);
+  monthStart.setUTCDate(1);
+  monthStart.setUTCHours(0, 0, 0, 0);
+  const monthStartTime = new Date(monthStart.getTime() - 8 * 60 * 60 * 1000);
+  const monthEndTime = now;
+  
+  // 上月
+  const lastMonthStart = new Date(beijingNow);
+  lastMonthStart.setUTCMonth(lastMonthStart.getUTCMonth() - 1);
+  lastMonthStart.setUTCDate(1);
+  lastMonthStart.setUTCHours(0, 0, 0, 0);
+  const lastMonthStartTime = new Date(lastMonthStart.getTime() - 8 * 60 * 60 * 1000);
+  
+  const lastMonthEnd = new Date(beijingNow);
+  lastMonthEnd.setUTCDate(1);
+  lastMonthEnd.setUTCHours(0, 0, 0, 0);
+  const lastMonthEndTime = new Date(lastMonthEnd.getTime() - 8 * 60 * 60 * 1000);
+  
+  // 累计（从最早的数据开始）
+  const allStartTime = new Date(0);
+  const allEndTime = now;
+  
+  return {
+    today: { startTime: todayStartTime, endTime: todayEndTime },
+    month: { startTime: monthStartTime, endTime: monthEndTime },
+    lastMonth: { startTime: lastMonthStartTime, endTime: lastMonthEndTime },
+    all: { startTime: allStartTime, endTime: allEndTime }
+  };
+}
+
+// 计算指定时间范围内的提成收益
+async function calculateCommissionStats(employees, employeeIds, employeeMap, group, startTime, endTime) {
+  // 生成缓存键
+  const cacheKey = `commission-stats-${JSON.stringify(employeeIds)}-${startTime.getTime()}-${endTime.getTime()}`;
+  
+  // 尝试从缓存获取
+  const cachedStats = get(cacheKey);
+  if (cachedStats) {
+    return cachedStats;
+  }
+
+  const goldLogs = await GoldLog.find({
+    employeeId: { $in: employeeIds },
+    createTime: { $gte: startTime, $lt: endTime }
+  });
+
+  const stats = calculateStatsFromLogs(goldLogs, employeeMap, group, startTime, endTime);
+  
+  // 缓存结果，10分钟过期
+  set(cacheKey, stats, 10 * 60 * 1000);
+  
+  return stats;
+}
+
+// 从预获取的日志中计算统计数据
+function calculateStatsFromLogs(goldLogs, employeeMap, group, startTime, endTime) {
+  let totalEarnings = 0;
+  let totalCommission = 0;
+  let totalGold = 0;
+
+  for (const log of goldLogs) {
+    // 过滤时间范围
+    if (log.createTime >= startTime && log.createTime < endTime) {
+      const employee = employeeMap.get(log.employeeId);
+      if (employee) {
+        const joinedGroupAt = employee.joinedGroupAt || log.createTime;
+        if (log.createTime >= joinedGroupAt) {
+          const earnings = log.earnings || (log.gold / 1000); // 使用聚合查询的结果或回退计算
+          const commissionRate = log.commissionRate || group.commission;
+          const commissionAmount = earnings * commissionRate;
+          
+          totalEarnings += earnings;
+          totalCommission += commissionAmount;
+          totalGold += log.gold;
+        }
+      }
+    }
+  }
+
+  return {
+    totalEarnings,
+    totalCommission,
+    totalGold
+  };
+}
+
+// 组长专用接口：获取组提成收益（今日、本月、上月、累计）
+router.get('/group-leader/commission-stats', authMiddleware, async (req, res) => {
+  try {
+    // 生成缓存键
+    const cacheKey = `group-leader-commission-stats-${req.user.id}`;
+    
+    // 尝试从缓存获取
+    const cachedData = get(cacheKey);
+    if (cachedData) {
+      // 创建缓存数据的深拷贝
+      const responseData = JSON.parse(JSON.stringify(cachedData));
+      // 更新时间范围为当前时间
+      const timeRanges = getMultipleTimeRanges();
+      responseData.data.today.timeRange = {
+        startTime: timeRanges.today.startTime.toISOString(),
+        endTime: timeRanges.today.endTime.toISOString()
+      };
+      responseData.data.month.timeRange = {
+        startTime: timeRanges.month.startTime.toISOString(),
+        endTime: timeRanges.month.endTime.toISOString()
+      };
+      responseData.data.lastMonth.timeRange = {
+        startTime: timeRanges.lastMonth.startTime.toISOString(),
+        endTime: timeRanges.lastMonth.endTime.toISOString()
+      };
+      responseData.data.all.timeRange = {
+        startTime: timeRanges.all.startTime.toISOString(),
+        endTime: timeRanges.all.endTime.toISOString()
+      };
+      console.log('✅ Using cached data for commission-stats');
+      return res.json(responseData);
+    }
+    console.log('❌ No cached data found for commission-stats');
+
+    // 获取当前登录用户
+    const currentAdmin = await Admin.findById(req.user.id);
+    if (!currentAdmin) {
+      return res.status(404).json({ success: false, message: '用户不存在' });
+    }
+
+    // 检查是否为组长
+    if (!currentAdmin.teamGroupId) {
+      return res.status(403).json({ success: false, message: '您不是组长，没有权限访问此接口' });
+    }
+
+    // 获取组信息
+    const group = await TeamGroup.findById(currentAdmin.teamGroupId);
+    if (!group) {
+      return res.status(404).json({ success: false, message: '组不存在' });
+    }
+
+    // 获取该组的所有员工（使用多种条件筛选）
+    let employees;
+    const fanjieUserId = currentAdmin._id.toString();
+    const fanjieTeamGroupId = currentAdmin.teamGroupId;
+    
+    employees = await Employee.find({
+      $or: [
+        { teamGroupId: fanjieTeamGroupId.toString() },
+        { teamGroupId: fanjieTeamGroupId },
+        { teamGroupId: fanjieUserId }, // 处理直接存储用户ID的情况
+        { teamGroupId: currentAdmin._id } // 处理ObjectId的情况
+      ]
+    });
+    const employeeIds = employees.map(e => e.employeeId);
+    const memberCount = employees.length;
+
+    // 创建员工ID到员工信息的映射
+    const employeeMap = new Map();
+    employees.forEach(employee => {
+      employeeMap.set(employee.employeeId, employee);
+    });
+
+    // 获取多个时间范围
+    const timeRanges = getMultipleTimeRanges();
+
+    // 使用聚合查询在数据库端完成所有时间范围的统计计算
+    const pipeline = [
+      {
+        $match: {
+          employeeId: { $in: employeeIds },
+          createTime: { $gte: timeRanges.lastMonth.startTime, $lt: timeRanges.all.endTime }
+        }
+      },
+      {
+        $project: {
+          employeeId: 1,
+          gold: 1,
+          createTime: 1,
+          commissionRate: 1,
+          earnings: { $divide: ["$gold", 1000] },
+          // 标记各个时间范围
+          isToday: {
+            $and: [
+              { $gte: ["$createTime", timeRanges.today.startTime] },
+              { $lt: ["$createTime", timeRanges.today.endTime] }
+            ]
+          },
+          isMonth: {
+            $and: [
+              { $gte: ["$createTime", timeRanges.month.startTime] },
+              { $lt: ["$createTime", timeRanges.month.endTime] }
+            ]
+          },
+          isLastMonth: {
+            $and: [
+              { $gte: ["$createTime", timeRanges.lastMonth.startTime] },
+              { $lt: ["$createTime", timeRanges.lastMonth.endTime] }
+            ]
+          },
+          isAll: true // 所有记录都属于累计范围
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          // 今日统计
+          today: {
+            $push: {
+              $cond: ["$isToday", "$$ROOT", "$$REMOVE"]
+            }
+          },
+          // 本月统计
+          month: {
+            $push: {
+              $cond: ["$isMonth", "$$ROOT", "$$REMOVE"]
+            }
+          },
+          // 上月统计
+          lastMonth: {
+            $push: {
+              $cond: ["$isLastMonth", "$$ROOT", "$$REMOVE"]
+            }
+          },
+          // 累计统计
+          all: {
+            $push: "$$ROOT"
+          }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          // 计算今日统计数据
+          todayStats: {
+            totalEarnings: { $sum: "$today.earnings" },
+            totalCommission: {
+              $sum: {
+                $map: {
+                  input: "$today",
+                  as: "item",
+                  in: { $multiply: ["$$item.earnings", { $ifNull: ["$$item.commissionRate", group.commission] }] }
+                }
+              }
+            },
+            totalGold: { $sum: "$today.gold" }
+          },
+          // 计算本月统计数据
+          monthStats: {
+            totalEarnings: { $sum: "$month.earnings" },
+            totalCommission: {
+              $sum: {
+                $map: {
+                  input: "$month",
+                  as: "item",
+                  in: { $multiply: ["$$item.earnings", { $ifNull: ["$$item.commissionRate", group.commission] }] }
+                }
+              }
+            },
+            totalGold: { $sum: "$month.gold" }
+          },
+          // 计算上月统计数据
+          lastMonthStats: {
+            totalEarnings: { $sum: "$lastMonth.earnings" },
+            totalCommission: {
+              $sum: {
+                $map: {
+                  input: "$lastMonth",
+                  as: "item",
+                  in: { $multiply: ["$$item.earnings", { $ifNull: ["$$item.commissionRate", group.commission] }] }
+                }
+              }
+            },
+            totalGold: { $sum: "$lastMonth.gold" }
+          },
+          // 计算累计统计数据
+          allStats: {
+            totalEarnings: { $sum: "$all.earnings" },
+            totalCommission: {
+              $sum: {
+                $map: {
+                  input: "$all",
+                  as: "item",
+                  in: { $multiply: ["$$item.earnings", { $ifNull: ["$$item.commissionRate", group.commission] }] }
+                }
+              }
+            },
+            totalGold: { $sum: "$all.gold" }
+          }
+        }
+      }
+    ];
+
+    const [aggregationResult] = await GoldLog.aggregate(pipeline).exec();
+
+    // 提取统计结果，处理空数据情况
+    const todayStats = aggregationResult?.todayStats || { totalEarnings: 0, totalCommission: 0, totalGold: 0 };
+    const monthStats = aggregationResult?.monthStats || { totalEarnings: 0, totalCommission: 0, totalGold: 0 };
+    const lastMonthStats = aggregationResult?.lastMonthStats || { totalEarnings: 0, totalCommission: 0, totalGold: 0 };
+    const allStats = aggregationResult?.allStats || { totalEarnings: 0, totalCommission: 0, totalGold: 0 };
+
+    const responseData = {
+      success: true,
+      data: {
+        groupName: group.groupName,
+        groupLeaderName: group.groupLeaderName || currentAdmin.realName || currentAdmin.username,
+        commissionRate: group.commission,
+        memberCount: memberCount,
+        today: {
+          totalEarnings: todayStats.totalEarnings,
+          totalCommission: todayStats.totalCommission,
+          totalGold: todayStats.totalGold,
+          timeRange: {
+            startTime: timeRanges.today.startTime.toISOString(),
+            endTime: timeRanges.today.endTime.toISOString()
+          }
+        },
+        month: {
+          totalEarnings: monthStats.totalEarnings,
+          totalCommission: monthStats.totalCommission,
+          totalGold: monthStats.totalGold,
+          timeRange: {
+            startTime: timeRanges.month.startTime.toISOString(),
+            endTime: timeRanges.month.endTime.toISOString()
+          }
+        },
+        lastMonth: {
+          totalEarnings: lastMonthStats.totalEarnings,
+          totalCommission: lastMonthStats.totalCommission,
+          totalGold: lastMonthStats.totalGold,
+          timeRange: {
+            startTime: timeRanges.lastMonth.startTime.toISOString(),
+            endTime: timeRanges.lastMonth.endTime.toISOString()
+          }
+        },
+        all: {
+          totalEarnings: allStats.totalEarnings,
+          totalCommission: allStats.totalCommission,
+          totalGold: allStats.totalGold,
+          timeRange: {
+            startTime: timeRanges.all.startTime.toISOString(),
+            endTime: timeRanges.all.endTime.toISOString()
+          }
+        }
+      }
+    };
+    
+    // 缓存结果，15分钟过期
+    set(cacheKey, responseData, 15 * 60 * 1000);
+    console.log('✅ Data cached successfully for commission-stats');
+
+    res.json(responseData);
+  } catch (error) {
+    console.error('获取组长提成统计错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 组长专用接口：获取组提成和平均金币
+router.get('/group-leader/stats', authMiddleware, async (req, res) => {
+  try {
+    const { range = 'today' } = req.query;
+
+    // 生成缓存键
+    const cacheKey = `group-leader-stats-${req.user.id}-${range}`;
+    
+    // 尝试从缓存获取
+    const cachedData = get(cacheKey);
+    if (cachedData) {
+      return res.json(cachedData);
+    }
+
+    // 获取当前登录用户
+    const currentAdmin = await Admin.findById(req.user.id);
+    if (!currentAdmin) {
+      return res.status(404).json({ success: false, message: '用户不存在' });
+    }
+
+    // 检查是否为组长
+    if (!currentAdmin.teamGroupId) {
+      return res.status(403).json({ success: false, message: '您不是组长，没有权限访问此接口' });
+    }
+
+    // 获取组信息
+    const group = await TeamGroup.findById(currentAdmin.teamGroupId);
+    if (!group) {
+      return res.status(404).json({ success: false, message: '组不存在' });
+    }
+
+    // 获取时间范围
+    const { startTime, endTime } = getTimeRange(range);
+
+    // 获取该组的所有员工（使用多种条件筛选）
+    let employees;
+    const fanjieUserId = currentAdmin._id.toString();
+    const fanjieTeamGroupId = currentAdmin.teamGroupId;
+    
+    employees = await Employee.find({
+      $or: [
+        { teamGroupId: fanjieTeamGroupId.toString() },
+        { teamGroupId: fanjieTeamGroupId },
+        { teamGroupId: fanjieUserId }, // 处理直接存储用户ID的情况
+        { teamGroupId: currentAdmin._id } // 处理ObjectId的情况
+      ]
+    });
+    const employeeIds = employees.map(e => e.employeeId);
+    const memberCount = employees.length;
+
+    // 获取指定时间范围内的金币记录
+    const goldLogs = await GoldLog.find({
+      employeeId: { $in: employeeIds },
+      createTime: { $gte: startTime, $lt: endTime }
+    });
+
+    // 创建员工ID到员工信息的映射
+    const employeeMap = new Map();
+    employees.forEach(employee => {
+      employeeMap.set(employee.employeeId, employee);
+    });
+
+    // 计算总收益、总提成和总金币
+    let totalEarnings = 0;
+    let totalCommission = 0;
+    let totalGold = 0;
+
+    for (const log of goldLogs) {
+      const employee = employeeMap.get(log.employeeId);
+      if (employee) {
+        // 检查金币产生时间是否在入组时间之后
+        const joinedGroupAt = employee.joinedGroupAt || log.createTime;
+        if (log.createTime >= joinedGroupAt) {
+          const earnings = log.gold / 1000;
+          const commissionRate = log.commissionRate || group.commission;
+          const commissionAmount = earnings * commissionRate;
+          
+          totalEarnings += earnings;
+          totalCommission += commissionAmount;
+          totalGold += log.gold;
+        }
+      }
+    }
+
+    // 计算平均金币（按所有成员）
+    const avgGoldByAll = memberCount > 0 ? totalGold / memberCount : 0;
+
+    const responseData = {
+      success: true,
+      data: {
+        groupName: group.groupName,
+        groupLeaderName: group.groupLeaderName || currentAdmin.realName || currentAdmin.username,
+        commissionRate: group.commission,
+        memberCount: memberCount,
+        totalMemberCount: memberCount,
+        range: range,
+        timeRange: {
+          startTime: startTime.toISOString(),
+          endTime: endTime.toISOString()
+        },
+        totalEarnings: totalEarnings,
+        totalPerformance: totalEarnings,
+        totalCommission: totalCommission,
+        totalGold: totalGold,
+        avgGoldByAll: avgGoldByAll
+      }
+    };
+    
+    // 缓存结果，15分钟过期
+    set(cacheKey, responseData, 15 * 60 * 1000);
+
+    res.json(responseData);
+  } catch (error) {
+    console.error('获取组长统计错误:', error);
     res.status(500).json({ success: false, message: '服务器错误' });
   }
 });

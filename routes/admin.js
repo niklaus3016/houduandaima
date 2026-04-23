@@ -180,7 +180,7 @@ router.get('/group-leader-commission/:teamGroupId', authMiddleware, async (req, 
               date: log.createTime.toISOString().split('T')[0],
               time: log.createTime.toISOString().split('T')[1].split('.')[0],
               employeeId: log.employeeId,
-              employeeName: '测试员工' + log.employeeId,
+              employeeName: employee.realName || employee.username || log.employeeId,
               gold: log.gold,
               earnings: earnings,
               commission: commissionRate,
@@ -438,6 +438,139 @@ router.get('/8202-fixed-commission', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error('获取8202员工固定提成记录错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 手动为用户添加金币记录
+router.post('/add-gold-records', authMiddleware, async (req, res) => {
+  try {
+    const { employeeId, count, goldPerRecord } = req.body;
+    
+    // 验证参数
+    if (!employeeId) {
+      return res.status(400).json({ success: false, message: '请输入员工ID' });
+    }
+    if (!count || count <= 0) {
+      return res.status(400).json({ success: false, message: '请输入有效的记录条数' });
+    }
+    if (!goldPerRecord || goldPerRecord <= 0) {
+      return res.status(400).json({ success: false, message: '请输入有效的金币数量' });
+    }
+    
+    // 查找用户的UserGold记录
+    const userGold = await UserGold.findOne({ employeeId });
+    if (!userGold) {
+      return res.status(404).json({ success: false, message: '用户不存在' });
+    }
+    
+    const userId = userGold.userId;
+    const currentTime = new Date();
+    const addedRecords = [];
+    
+    // 添加金币记录
+    for (let i = 0; i < count; i++) {
+      const goldLog = new GoldLog({
+        userId: userId,
+        employeeId: employeeId,
+        gold: goldPerRecord,
+        type: 'admin_manual',
+        createTime: currentTime,
+        remark: `超管手动添加 ${goldPerRecord} 金币`
+      });
+      await goldLog.save();
+      addedRecords.push(goldLog);
+    }
+    
+    // 更新UserGold记录
+    userGold.currentMonthGold = (userGold.currentMonthGold || 0) + (count * goldPerRecord);
+    userGold.adCount = (userGold.adCount || 0) + count;
+    await userGold.save();
+    
+    res.json({
+      success: true,
+      message: `成功添加${count}条金币记录，每条${goldPerRecord}金币`,
+      data: {
+        employeeId: employeeId,
+        totalAdded: count * goldPerRecord,
+        records: addedRecords
+      }
+    });
+  } catch (error) {
+    console.error('手动添加金币记录错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 获取超管手动添加的金币记录
+router.get('/admin-gold-records', authMiddleware, async (req, res) => {
+  try {
+    const { page = 1, limit = 20, employeeId, month } = req.query;
+
+    // 构建查询条件
+    const query = {
+      type: 'admin_manual'
+    };
+
+    if (employeeId) {
+      query.employeeId = employeeId;
+    }
+
+    // 按月份筛选
+    if (month) {
+      const [year, monthNum] = month.split('-');
+      const startDate = new Date(parseInt(year), parseInt(monthNum) - 1, 1);
+      const endDate = new Date(parseInt(year), parseInt(monthNum), 0, 23, 59, 59, 999);
+      query.createTime = {
+        $gte: startDate,
+        $lte: endDate
+      };
+    }
+
+    // 使用聚合管道在数据库端计算总数和总金币，避免加载所有数据到内存
+    const aggregation = await GoldLog.aggregate([
+      { $match: query },
+      {
+        $facet: {
+          total: [{ $count: 'count' }],
+          totalGold: [{ $group: { _id: null, sum: { $sum: '$gold' } } }],
+          records: [
+            { $sort: { createTime: -1 } },
+            { $skip: (parseInt(page) - 1) * parseInt(limit) },
+            { $limit: parseInt(limit) }
+          ]
+        }
+      }
+    ]);
+
+    const total = aggregation[0].total[0]?.count || 0;
+    const totalGold = aggregation[0].totalGold[0]?.sum || 0;
+    const records = aggregation[0].records;
+
+    res.json({
+      success: true,
+      data: {
+        records: records.map(record => ({
+          id: record._id,
+          employeeId: record.employeeId,
+          gold: record.gold,
+          createTime: record.createTime,
+          remark: record.remark
+        })),
+        pagination: {
+          total,
+          page: Number(page),
+          limit: Number(limit),
+          pages: Math.ceil(total / limit)
+        },
+        summary: {
+          totalRecords: total,
+          totalGold: totalGold
+        }
+      }
+    });
+  } catch (error) {
+    console.error('获取超管手动添加的金币记录错误:', error);
     res.status(500).json({ success: false, message: '服务器错误' });
   }
 });
@@ -1590,6 +1723,85 @@ router.post('/lottery/clear-data', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('清除数据失败:', error);
     res.status(500).json({ success: false, message: '清除数据失败' });
+  }
+});
+
+// 启用/禁用管理员账号（团队长账号）
+router.put('/account/:id/status', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    
+    if (!status || !['enabled', 'disabled'].includes(status)) {
+      return res.status(400).json({ success: false, message: '无效的状态值' });
+    }
+    
+    const admin = await Admin.findById(id);
+    if (!admin) {
+      return res.status(404).json({ success: false, message: '账号不存在' });
+    }
+    
+    admin.status = status;
+    admin.updatedAt = new Date();
+    await admin.save();
+
+    res.json({
+      success: true,
+      message: `账号已${status === 'enabled' ? '启用' : '禁用'}`,
+      data: {
+        _id: admin._id,
+        username: admin.username,
+        realName: admin.realName,
+        status: admin.status,
+        role: admin.role,
+        updatedAt: admin.updatedAt
+      }
+    });
+  } catch (error) {
+    console.error('更新账号状态错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 更新管理员账号信息
+router.put('/account/:id', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updateData = req.body;
+    
+    const admin = await Admin.findById(id);
+    if (!admin) {
+      return res.status(404).json({ success: false, message: '账号不存在' });
+    }
+    
+    // 只允许更新特定字段
+    const allowedFields = ['realName', 'phone', 'status', 'role', 'teamName'];
+    Object.keys(updateData).forEach(key => {
+      if (allowedFields.includes(key)) {
+        admin[key] = updateData[key];
+      }
+    });
+    
+    admin.updatedAt = new Date();
+    await admin.save();
+
+    res.json({
+      success: true,
+      message: '账号信息已更新',
+      data: {
+        _id: admin._id,
+        username: admin.username,
+        realName: admin.realName,
+        phone: admin.phone,
+        status: admin.status,
+        role: admin.role,
+        teamName: admin.teamName,
+        updatedAt: admin.updatedAt
+      }
+    });
+  } catch (error) {
+    console.error('更新账号信息错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
   }
 });
 

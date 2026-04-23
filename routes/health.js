@@ -1,10 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
-const authMiddleware = require('../middleware/auth');
 
-// 健康检查接口
-router.get('/', authMiddleware, async (req, res) => {
+// 健康检查接口（不需要认证）
+router.get('/', async (req, res) => {
   try {
     // 检查数据库连接状态
     const dbState = mongoose.connection.readyState;

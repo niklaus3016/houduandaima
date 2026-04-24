@@ -321,10 +321,9 @@ router.get('/kpi', authMiddleware, async (req, res) => {
       ? ((avgEcpm - prevAvgEcpm) / prevAvgEcpm * 100).toFixed(1) 
       : 0;
     
-    // 利润率计算 - 修正逻辑，使用合理的成本计算
-    const profitMargin = totalRevenue > 0 ? ((totalRevenue - totalRevenue * 0.8) / totalRevenue * 100).toFixed(1) : 0;
+    const profitMargin = totalRevenue > 0 ? ((totalRevenue - totalGold * 0.01) / totalRevenue * 100).toFixed(1) : 0;
     const prevProfitMargin = prevTotalRevenue > 0 
-      ? ((prevTotalRevenue - prevTotalRevenue * 0.8) / prevTotalRevenue * 100).toFixed(1) 
+      ? ((prevTotalRevenue - prevTotalGold * 0.01) / prevTotalRevenue * 100).toFixed(1) 
       : 0;
     const profitMarginGrowth = prevProfitMargin > 0 
       ? (profitMargin - prevProfitMargin).toFixed(1) 
@@ -910,10 +909,13 @@ router.get('/team-leader', authMiddleware, async (req, res) => {
           ? ((avgEcpm - prevAvgEcpm) / prevAvgEcpm * 100).toFixed(1) 
           : 0;
         
-        // 利润率计算 - 修正逻辑，使用合理的成本计算
-        const profitMargin = totalRevenue > 0 ? ((totalRevenue - totalRevenue * 0.8) / totalRevenue * 100).toFixed(1) : 0;
-        const prevProfitMargin = prevTotalRevenue > 0 ? ((prevTotalRevenue - prevTotalRevenue * 0.8) / prevTotalRevenue * 100).toFixed(1) : 0;
-        const profitMarginGrowth = prevProfitMargin > 0 ? (profitMargin - prevProfitMargin).toFixed(1) : 0;
+        const profitMargin = totalRevenue > 0 ? ((totalRevenue - totalGold * 0.01) / totalRevenue * 100).toFixed(1) : 0;
+        const prevProfitMargin = prevTotalRevenue > 0 
+          ? ((prevTotalRevenue - prevTotalGold * 0.01) / prevTotalRevenue * 100).toFixed(1) 
+          : 0;
+        const profitMarginGrowth = prevProfitMargin > 0 
+          ? (profitMargin - prevProfitMargin).toFixed(1) 
+          : 0;
         
         kpiData = {
           revenue: parseFloat(totalRevenue.toFixed(2)),
@@ -1119,9 +1121,8 @@ router.get('/team-leader', authMiddleware, async (req, res) => {
         const prevAvgEcpm = prev.count > 0 ? (prevTotalEcpm / prev.count).toFixed(2) : 0;
         const ecpmGrowth = prevAvgEcpm > 0 ? ((avgEcpm - prevAvgEcpm) / prevAvgEcpm * 100).toFixed(1) : 0;
         
-        // 利润率计算 - 修正逻辑，使用合理的成本计算
-        const profitMargin = totalRevenue > 0 ? ((totalRevenue - totalRevenue * 0.8) / totalRevenue * 100).toFixed(1) : 0;
-        const prevProfitMargin = prevTotalRevenue > 0 ? ((prevTotalRevenue - prevTotalRevenue * 0.8) / prevTotalRevenue * 100).toFixed(1) : 0;
+        const profitMargin = totalRevenue > 0 ? ((totalRevenue - totalGold * 0.01) / totalRevenue * 100).toFixed(1) : 0;
+        const prevProfitMargin = prevTotalRevenue > 0 ? ((prevTotalRevenue - prevTotalGold * 0.01) / prevTotalRevenue * 100).toFixed(1) : 0;
         const profitMarginGrowth = prevProfitMargin > 0 ? (profitMargin - prevProfitMargin).toFixed(1) : 0;
         
         kpiData = {
@@ -1277,26 +1278,9 @@ router.get('/team-leader', authMiddleware, async (req, res) => {
     let kpiData = null; // getFromCache(kpiCacheKey);
     
     if (!kpiData) {
-      // 获取团队内所有组
-      const groups = await TeamGroup.find({ teamName: currentAdmin.teamName });
-      
-      // 获取所有组的员工
-      const allGroupEmployees = await Promise.all(groups.map(async (group) => {
-        if (group && group.groupName) {
-          return await Employee.find({
-            $or: [
-              { groupName: group.groupName },
-              { teamGroupId: group._id.toString() },
-              { teamGroupId: group._id }
-            ]
-          });
-        } else {
-          return await Employee.find({ teamGroupId: group._id.toString() });
-        }
-      }));
-      
-      // 合并所有员工ID
-      const employeeIds = Array.from(new Set(allGroupEmployees.flat().map(emp => emp.employeeId)));
+      const adminId = currentAdmin._id.toString ? currentAdmin._id.toString() : currentAdmin._id;
+      const employees = await Employee.find({ parentId: adminId });
+      const employeeIds = employees.map(e => e.employeeId);
       const teamMemberUserIds = employeeIds;
       
       // 时间范围
@@ -1431,9 +1415,8 @@ router.get('/team-leader', authMiddleware, async (req, res) => {
       const prevAvgGoldPerAd = prev.count > 0 ? (prevTotalGold / prev.count).toFixed(2) : 0;
       const avgGoldPerAdGrowth = prevAvgGoldPerAd > 0 ? ((avgGoldPerAd - prevAvgGoldPerAd) / prevAvgGoldPerAd * 100).toFixed(1) : 0;
       
-      // 利润率计算 - 修正逻辑，使用合理的成本计算
-      const profitMargin = totalRevenue > 0 ? ((totalRevenue - totalRevenue * 0.8) / totalRevenue * 100).toFixed(1) : 0;
-      const prevProfitMargin = prevTotalRevenue > 0 ? ((prevTotalRevenue - prevTotalRevenue * 0.8) / prevTotalRevenue * 100).toFixed(1) : 0;
+      const profitMargin = totalRevenue > 0 ? ((totalRevenue - totalGold * 0.01) / totalRevenue * 100).toFixed(1) : 0;
+      const prevProfitMargin = prevTotalRevenue > 0 ? ((prevTotalRevenue - prevTotalGold * 0.01) / prevTotalRevenue * 100).toFixed(1) : 0;
       const profitMarginGrowth = prevProfitMargin > 0 ? (profitMargin - prevProfitMargin).toFixed(1) : 0;
       
       kpiData = {
@@ -1571,10 +1554,8 @@ router.get('/team-leader', authMiddleware, async (req, res) => {
 
         const rangeGoldRevenue = currentStats.totalGold / 1000;
         const prevGoldRevenue = prev.totalGold / 1000;
-        // 统一使用固定的提成比率 5%
-        const commissionRate = 0.05;
-        const rangeCommission = rangeGoldRevenue * commissionRate;
-        const prevCommission = prevGoldRevenue * commissionRate;
+        const rangeCommission = rangeGoldRevenue * (group.commission || 0.05);
+        const prevCommission = prevGoldRevenue * (group.commission || 0.05);
         const avgEcpm = currentStats.count > 0 ? (currentStats.totalGold / currentStats.count) : 0;
 
         return {

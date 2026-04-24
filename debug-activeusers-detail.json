@@ -1,0 +1,42 @@
+{
+  "today": {
+    "kpi": {
+      "revenue": 1351.53,
+      "revenueGrowth": -54.3,
+      "coins": 817615.83,
+      "coinsGrowth": -45,
+      "impressions": 7837,
+      "impressionsGrowth": -28.3,
+      "clicks": 1175,
+      "clicksGrowth": -28.3,
+      "profitMargin": -505,
+      "profitMarginGrowth": 0,
+      "ecpm": 172.46,
+      "ecpmGrowth": -36.3,
+      "activeUsers": 0,
+      "activeUsersGrowth": -100
+    },
+    "employeesCount": 49,
+    "groupsCount": 3
+  },
+  "yesterday": {
+    "kpi": {
+      "revenue": 2958.93,
+      "revenueGrowth": 7.5,
+      "coins": 1487375.66,
+      "coinsGrowth": -1.1,
+      "impressions": 10933,
+      "impressionsGrowth": -8.5,
+      "clicks": 1639,
+      "clicksGrowth": -8.5,
+      "profitMargin": -402.7,
+      "profitMarginGrowth": 0,
+      "ecpm": 270.64,
+      "ecpmGrowth": 17.4,
+      "activeUsers": 24,
+      "activeUsersGrowth": -7.7
+    },
+    "employeesCount": 49,
+    "groupsCount": 3
+  }
+}

@@ -30,7 +30,7 @@ function set(key, data, ttl = 60 * 1000) {
       data,
       expiry: Date.now() + ttl
     });
-    console.log(`✅ 缓存设置成功: ${key}, 大小: ${dataSize} bytes`);
+    console.log(`✅ 缓存设置成功: ${key}, 大小: ${dataSize} bytes, 过期时间: ${new Date(Date.now() + ttl).toLocaleString()}`);
   } catch (error) {
     console.error('❌ 缓存设置失败:', error);
   }

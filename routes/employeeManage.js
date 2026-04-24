@@ -759,18 +759,10 @@ router.get('/team-leader/groups', authMiddleware, async (req, res) => {
     
     // 生成缓存键
     const cacheKey = `team_leader_groups_${teamId}_${range}`;
-    const cachedItem = cache.get(cacheKey);
-    if (cachedItem && Date.now() - cachedItem.timestamp < CACHE_TTL) {
-      return res.json({
-        success: true,
-        message: '获取团队组列表成功（缓存）',
-        data: cachedItem.data.data,
-        totalGroups: cachedItem.data.totalGroups,
-        totalMembers: cachedItem.data.totalMembers,
-        totalRevenue: cachedItem.data.totalRevenue,
-        fromCache: true
-      });
-    }
+    // 暂时跳过缓存检查，直接计算
+    console.log('=== 跳过缓存，直接计算 ===');
+    
+    console.log('=== 重新计算数据 ===');
     
     // 获取北京时间
     const beijingNow = new Date(Date.now() + 8 * 60 * 60 * 1000);
@@ -804,17 +796,52 @@ router.get('/team-leader/groups', authMiddleware, async (req, res) => {
       yesterdayEnd = new Date(yesterdayEndBeijing.getTime() - 8 * 60 * 60 * 1000);
     }
     
-    // 获取团队长的所有组
-    const groups = await TeamGroup.find({ teamLeaderId: teamId });
+    // 获取团队长的所有组（兼容字符串和ObjectId类型）
+    let groups;
+    try {
+      // 先尝试字符串查询
+      groups = await TeamGroup.find({ teamLeaderId: teamId });
+      
+      // 如果没找到，尝试ObjectId查询
+      if (groups.length === 0) {
+        try {
+          const objectId = new mongoose.Types.ObjectId(teamId);
+          groups = await TeamGroup.find({ teamLeaderId: objectId });
+        } catch (e) {
+          // 不是有效的ObjectId，忽略
+        }
+      }
+    } catch (error) {
+      console.error('查询TeamGroup失败:', error);
+      groups = [];
+    }
+
+    // 同时收集组的_id、teamLeaderId和groupLeaderId，用于查询员工
     const groupIds = groups.map(g => g._id.toString());
-    
-    // 查询有 teamGroupId 的员工（兼容 ObjectId 和 String 两种类型）
+    const teamLeaderIds = groups.map(g => g.teamLeaderId?.toString()).filter(id => id);
+    const groupLeaderIds = groups.map(g => g.groupLeaderId?.toString()).filter(id => id);
+
+    // 合并所有可能的ID
+    const allPossibleIds = [...groupIds, ...teamLeaderIds, ...groupLeaderIds];
+
+    // 调试日志
+    console.log('=== 调试信息 ===');
+    console.log('groups:', groups.length);
+    console.log('groupIds:', groupIds);
+    console.log('teamLeaderIds:', teamLeaderIds);
+    console.log('groupLeaderIds:', groupLeaderIds);
+    console.log('allPossibleIds:', allPossibleIds);
+
+    // 查询有 teamGroupId 的员工（直接使用字符串类型）
     const allEmployees = await Employee.find({
-      $or: [
-        { teamGroupId: { $in: groupIds } },
-        { teamGroupId: { $in: groupIds.map(id => new mongoose.Types.ObjectId(id)) } }
-      ]
+      teamGroupId: { $in: allPossibleIds }
     });
+
+    // 调试日志
+    console.log('allEmployees:', allEmployees.length);
+    if (allEmployees.length > 0) {
+      console.log('前3个员工:', allEmployees.slice(0, 3).map(e => e.employeeId));
+    }
     
     // 根据 groupName 分组
     const employeesByGroup = {};

@@ -888,7 +888,7 @@ router.get('/group-leader/commission-stats', authMiddleware, async (req, res) =>
                 $map: {
                   input: "$today",
                   as: "item",
-                  in: { $multiply: ["$$item.earnings", { $ifNull: ["$$item.commissionRate", group.commission] }] }
+                  in: { $multiply: ["$$item.earnings", { $literal: group.commission }] }
                 }
               }
             },
@@ -902,7 +902,7 @@ router.get('/group-leader/commission-stats', authMiddleware, async (req, res) =>
                 $map: {
                   input: "$month",
                   as: "item",
-                  in: { $multiply: ["$$item.earnings", { $ifNull: ["$$item.commissionRate", group.commission] }] }
+                  in: { $multiply: ["$$item.earnings", { $literal: group.commission }] }
                 }
               }
             },
@@ -916,7 +916,7 @@ router.get('/group-leader/commission-stats', authMiddleware, async (req, res) =>
                 $map: {
                   input: "$lastMonth",
                   as: "item",
-                  in: { $multiply: ["$$item.earnings", { $ifNull: ["$$item.commissionRate", group.commission] }] }
+                  in: { $multiply: ["$$item.earnings", { $literal: group.commission }] }
                 }
               }
             },
@@ -930,7 +930,7 @@ router.get('/group-leader/commission-stats', authMiddleware, async (req, res) =>
                 $map: {
                   input: "$all",
                   as: "item",
-                  in: { $multiply: ["$$item.earnings", { $ifNull: ["$$item.commissionRate", group.commission] }] }
+                  in: { $multiply: ["$$item.earnings", { $literal: group.commission }] }
                 }
               }
             },
@@ -1071,45 +1071,72 @@ router.get('/group-leader/stats', authMiddleware, async (req, res) => {
     let totalEarnings = 0;
     let totalCommission = 0;
     let totalGold = 0;
+    let totalAdExposure = 0; // 总广告曝光量
+
+    // 使用组的统一提成比率
+    const commissionRate = group.commission;
 
     for (const log of goldLogs) {
       const employee = employeeMap.get(log.employeeId);
       if (employee) {
-        // 检查金币产生时间是否在入组时间之后
-        const joinedGroupAt = employee.joinedGroupAt || log.createTime;
-        if (log.createTime >= joinedGroupAt) {
-          const earnings = log.gold / 1000;
-          const commissionRate = log.commissionRate || group.commission;
-          const commissionAmount = earnings * commissionRate;
-          
-          totalEarnings += earnings;
-          totalCommission += commissionAmount;
-          totalGold += log.gold;
-        }
+        // 不考虑入组时间，直接计算所有符合时间范围的金币记录
+        const earnings = log.gold / 1000;
+        const commissionAmount = earnings * commissionRate;
+        
+        totalEarnings += earnings;
+        totalCommission += commissionAmount;
+        totalGold += log.gold;
+        totalAdExposure += 1; // 每个GoldLog记录代表一次广告曝光
       }
     }
 
-    // 计算平均金币（按所有成员）
-    const avgGoldByAll = memberCount > 0 ? totalGold / memberCount : 0;
+    // 获取昨日数据用于计算增长率
+    const { startTime: yesterdayStart, endTime: yesterdayEnd } = getTimeRange('yesterday');
+    const yesterdayGoldLogs = await GoldLog.find({
+      employeeId: { $in: employeeIds },
+      createTime: { $gte: yesterdayStart, $lt: yesterdayEnd }
+    });
+
+    let yesterdayEarnings = 0;
+    let yesterdayCommission = 0;
+    let yesterdayAdExposure = 0;
+
+    for (const log of yesterdayGoldLogs) {
+      const employee = employeeMap.get(log.employeeId);
+      if (employee) {
+        // 不考虑入组时间，直接计算所有符合时间范围的金币记录
+        const earnings = log.gold / 1000;
+        const commissionAmount = earnings * commissionRate;
+        
+        yesterdayEarnings += earnings;
+        yesterdayCommission += commissionAmount;
+        yesterdayAdExposure += 1; // 每个GoldLog记录代表一次广告曝光
+      }
+    }
+
+    // 计算增长率
+    const calculateGrowthRate = (current, previous) => {
+      if (previous === 0) return current > 0 ? 100 : 0;
+      return ((current - previous) / previous) * 100;
+    };
+
+    const earningsGrowthRate = calculateGrowthRate(totalEarnings, yesterdayEarnings);
+    const commissionGrowthRate = calculateGrowthRate(totalCommission, yesterdayCommission);
+    const adExposureGrowthRate = calculateGrowthRate(totalAdExposure, yesterdayAdExposure);
 
     const responseData = {
       success: true,
       data: {
         groupName: group.groupName,
         groupLeaderName: group.groupLeaderName || currentAdmin.realName || currentAdmin.username,
-        commissionRate: group.commission,
         memberCount: memberCount,
-        totalMemberCount: memberCount,
-        range: range,
-        timeRange: {
-          startTime: startTime.toISOString(),
-          endTime: endTime.toISOString()
-        },
-        totalEarnings: totalEarnings,
-        totalPerformance: totalEarnings,
-        totalCommission: totalCommission,
+        totalAdExposure: totalAdExposure,
         totalGold: totalGold,
-        avgGoldByAll: avgGoldByAll
+        totalEarnings: totalEarnings,
+        totalCommission: totalCommission,
+        earningsGrowthRate: earningsGrowthRate,
+        commissionGrowthRate: commissionGrowthRate,
+        adExposureGrowthRate: adExposureGrowthRate
       }
     };
     

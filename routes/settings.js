@@ -6,7 +6,7 @@ const authMiddleware = require('../middleware/auth');
 // 获取提现开关状态
 router.get('/withdraw-status', async (req, res) => {
   try {
-    const config = await SystemConfig.findOne({ key: 'withdrawEnabled' });
+    const config = await SystemConfig.findOne({ key: 'withdraw_enabled' });
     
     res.json({
       success: true,
@@ -28,7 +28,7 @@ router.post('/withdraw-status', authMiddleware, async (req, res) => {
     }
     
     await SystemConfig.findOneAndUpdate(
-      { key: 'withdrawEnabled' },
+      { key: 'withdraw_enabled' },
       { value: enabled, updatedAt: new Date() },
       { upsert: true }
     );

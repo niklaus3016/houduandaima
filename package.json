@@ -29,5 +29,8 @@
     "mongodb"
   ],
   "author": "",
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^25.6.0"
+  }
 }

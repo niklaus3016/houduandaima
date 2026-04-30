@@ -36,6 +36,10 @@ const withdrawRecordSchema = new mongoose.Schema({
   createTime: {
     type: Date,
     default: Date.now
+  },
+  type: {
+    type: String,
+    default: 'employee'
   }
 });
 

@@ -1,27 +1,41 @@
 const mongoose = require('mongoose');
-const TeamGroup = require('./models/TeamGroup');
+const Admin = require('./models/Admin');
 const Employee = require('./models/Employee');
+const TeamGroup = require('./models/TeamGroup');
 
-mongoose.connect('mongodb://127.0.0.1:27017/lz');
-
-(async () => {
-  const group = await TeamGroup.findOne({ groupName: '洁然如初代理' });
-  console.log('组ID:', group._id.toString());
+mongoose.connect('mongodb://root:9yx7pAD9851A7W7Q@lzjzb-sjk-mongodb.ns-tlwyfho9.svc:27017').then(async () => {
+  const admin = await Admin.findOne({ username: 'cuiding' });
+  console.log('管理员:', admin.username);
+  console.log('团队:', admin.teamName);
   
-  const employees = await Employee.find({ teamGroupId: group._id.toString() });
-  console.log('员工数量:', employees.length);
-  console.log('员工号列表:');
-  employees.forEach((e, i) => {
-    console.log(`  ${i+1}. ${e.employeeId} - ${e.realName || ''}`);
+  const employees = await Employee.find({ parentId: admin._id.toString() });
+  console.log('总员工数:', employees.length);
+  
+  const groups = await TeamGroup.find({ teamName: admin.teamName });
+  console.log('组别数:', groups.length);
+  
+  // 统计各组员工数
+  let groupedCount = 0;
+  for (const group of groups) {
+    const groupEmps = employees.filter(e => 
+      e.groupName === group.groupName || 
+      e.teamGroupId === group._id.toString()
+    );
+    groupedCount += groupEmps.length;
+    console.log(`组 ${group.groupName}: ${groupEmps.length}人`);
+  }
+  
+  // 未分组员工
+  const noGroup = employees.filter(e => {
+    const hasGroup = groups.some(g => 
+      e.groupName === g.groupName || 
+      e.teamGroupId === g._id.toString()
+    );
+    return !hasGroup;
   });
   
-  // 再查一下parentId等于团队长的员工
-  console.log('\nparentId等于团队长的员工:');
-  const parentEmployees = await Employee.find({ parentId: group.teamLeaderId });
-  console.log('数量:', parentEmployees.length);
-  parentEmployees.forEach((e, i) => {
-    console.log(`  ${i+1}. ${e.employeeId} - ${e.realName || ''}`);
-  });
+  console.log('未分组员工数:', noGroup.length);
+  console.log('已分组员工数:', groupedCount);
   
-  process.exit(0);
-})();
+  await mongoose.connection.close();
+});

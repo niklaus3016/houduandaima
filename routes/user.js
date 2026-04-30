@@ -353,17 +353,35 @@ router.get('/login-stats', async (req, res) => {
 router.get('/low-performance', authMiddleware, async (req, res) => {
   try {
     const { team } = req.query;
-    
+
     // 计算昨天的日期（北京时间）
     const todayStart = getBeijingStartOfDay();
     const yesterday = new Date(todayStart);
     yesterday.setDate(yesterday.getDate() - 1);
     const yesterdayStart = new Date(yesterday);
-    
-    // 获取所有用户
-    let users = await UserGold.find({});
-    let employeeIds = users.map(user => user.employeeId);
-    
+
+    // 使用聚合管道优化：在数据库层完成分组统计
+    const MAX_USERS = 1000;
+    const goldLogsAggregation = await GoldLog.aggregate([
+      { $match: { createTime: { $gte: yesterdayStart, $lt: todayStart } } },
+      { $group: {
+        _id: '$employeeId',
+        watched: { $sum: 1 },
+        earnings: { $sum: '$gold' },
+        ecpmTotal: { $sum: { $ifNull: ['$ecpm', 0] } }
+      }},
+      { $limit: MAX_USERS }
+    ]);
+
+    // 提取有金币记录的员工ID
+    const employeeIdsWithGold = goldLogsAggregation.map(log => log._id);
+
+    // 只查询有金币记录的用户
+    let users = employeeIdsWithGold.length > 0
+      ? await UserGold.find({ employeeId: { $in: employeeIdsWithGold } })
+      : [];
+    let employeeIds = employeeIdsWithGold;
+
     // 团队筛选
     if (team) {
       const targetTeam = await Team.findOne({ name: team });
@@ -374,32 +392,21 @@ router.get('/low-performance', authMiddleware, async (req, res) => {
         users = users.filter(user => employeeIds.includes(user.employeeId));
       }
     }
-    
-    // 获取昨天的金币日志
-    const goldLogs = await GoldLog.find({
-      createTime: { $gte: yesterdayStart, $lt: todayStart }
+
+    // 使用聚合后的统计数据
+    const userStatsMap = {};
+    goldLogsAggregation.forEach(log => {
+      userStatsMap[log._id] = {
+        watched: log.watched,
+        earnings: log.earnings / 1000,
+        ecpmTotal: log.ecpmTotal
+      };
     });
-    
-    // 按用户分组统计
-    const userStats = {};
-    goldLogs.forEach(log => {
-      const employeeId = log.employeeId;
-      if (!userStats[employeeId]) {
-        userStats[employeeId] = {
-          watched: 0,
-          earnings: 0,
-          ecpmTotal: 0
-        };
-      }
-      userStats[employeeId].watched += 1;
-      userStats[employeeId].earnings += log.gold / 1000; // 转换为元
-      userStats[employeeId].ecpmTotal += log.ecpm || 0;
-    });
-    
+
     // 生成低绩效用户列表
     const lowPerfUsers = [];
     users.forEach(user => {
-      const stats = userStats[user.employeeId] || { watched: 0, earnings: 0, ecpmTotal: 0 };
+      const stats = userStatsMap[user.employeeId] || { watched: 0, earnings: 0, ecpmTotal: 0 };
       const ecpm = stats.watched > 0 ? stats.ecpmTotal / stats.watched : 0;
       
       // 简单的低绩效判断：观看次数 < 50 或 收益 < 5 元

@@ -12,35 +12,100 @@ function getBeijingDate() {
   return new Date(now.getTime() + 8 * 60 * 60 * 1000);
 }
 
+// 系统配置缓存
+const configCache = {
+  commissionRate: { value: 0.5, expiry: 0 },
+  redPacketInjectRate: { value: 0.025, expiry: 0 },
+  poolPercentage: { value: 0.1, expiry: 0 }
+};
+const CONFIG_CACHE_TTL = 10000; // 10秒缓存（commissionRate一天变几十次，需要及时更新）
+
+// LotterySettings 缓存
+let lotterySettingsCache = null;
+let lotterySettingsCacheTime = 0;
+const LOTTERY_SETTINGS_CACHE_TTL = 60000; // 60秒
+
+// 员工组别提成缓存
+const employeeGroupCache = new Map();
+const EMPLOYEE_GROUP_CACHE_TTL = 60000; // 60秒
+
+function cleanExpiredEmployeeCache() {
+  const now = Date.now();
+  for (const [key, value] of employeeGroupCache.entries()) {
+    if (now - value.time >= EMPLOYEE_GROUP_CACHE_TTL) {
+      employeeGroupCache.delete(key);
+    }
+  }
+}
+
+function getEmployeeGroupCache(employeeId) {
+  const cached = employeeGroupCache.get(employeeId);
+  if (cached && (Date.now() - cached.time) < EMPLOYEE_GROUP_CACHE_TTL) {
+    return cached.commission;
+  }
+  return null;
+}
+
+function setEmployeeGroupCache(employeeId, commission) {
+  if (employeeGroupCache.size > 1000) {
+    cleanExpiredEmployeeCache();
+  }
+  employeeGroupCache.set(employeeId, { commission, time: Date.now() });
+}
+
+async function getConfig(key) {
+  const now = Date.now();
+  if (configCache[key] && now < configCache[key].expiry) {
+    return configCache[key].value;
+  }
+  
+  try {
+    const config = await SystemConfig.findOne({ key });
+    if (config) {
+      configCache[key] = { value: config.value, expiry: now + CONFIG_CACHE_TTL };
+      return config.value;
+    }
+  } catch (err) {
+    console.error(`查询系统配置 ${key} 错误:`, err);
+  }
+  return null;
+}
+
 // 上报ECPM发金币
 router.post('/reward', async (req, res) => {
   try {
     const { userId, employeeId, ecpm, slotId, deviceId } = req.body;
-    
+
     if (!userId || !employeeId || !ecpm || !deviceId) {
       return res.status(400).json({ success: false, message: '缺少必要参数' });
     }
-    
-    // 获取分成比例（默认50%）
-    let commissionRate = 0.5;
-    try {
-      const config = await SystemConfig.findOne({ key: 'commissionRate' });
-      if (config) {
-        commissionRate = config.value;
+
+    // 获取分成比例（默认50%），使用缓存
+    let commissionRate = await getConfig('commissionRate');
+    if (commissionRate === null) commissionRate = 0.5;
+
+    // 获取彩票设置（带缓存，只查一次）
+    const LotterySettings = require('../models/LotterySettings');
+    let settings = null;
+    if (lotterySettingsCache && (Date.now() - lotterySettingsCacheTime) < LOTTERY_SETTINGS_CACHE_TTL) {
+      settings = lotterySettingsCache;
+    } else {
+      settings = await LotterySettings.findOne();
+      if (!settings) {
+        settings = new LotterySettings();
+        await settings.save();
       }
-    } catch (err) {
-      console.error('查询系统配置错误:', err);
-      // 即使查询失败，也使用默认值
+      lotterySettingsCache = settings;
+      lotterySettingsCacheTime = Date.now();
     }
-    
+
     // 计算金币（ECPM * 分成比例）
     const gold = ecpm * commissionRate;
-    
+
     // 更新用户金币和广告次数
     let userGold = await UserGold.findOne({ userId });
-    
+
     if (!userGold) {
-      // 如果用户不存在，创建新记录
       userGold = new UserGold({
         userId,
         employeeId,
@@ -49,58 +114,39 @@ router.post('/reward', async (req, res) => {
         adCount: 1
       });
     } else {
-      // 更新当月金币和广告次数
       userGold.currentMonthGold += gold;
       userGold.adCount += 1;
     }
-    
+
     // 检查是否达到广告次数阈值，生成奖券
     let ticketNumber = null;
     let issueNumber = null;
-    try {
-      const LotterySettings = require('../models/LotterySettings');
-      const LotteryTicket = require('../models/LotteryTicket');
-      
-      // 获取彩票设置
-      let settings = await LotterySettings.findOne();
-      if (!settings) {
-        settings = new LotterySettings();
-        await settings.save();
-      }
-      
-      // 检查是否达到广告次数阈值
-      if (userGold.adCount >= settings.adCountThreshold) {
-        // 生成期号
+
+    if (userGold.adCount >= settings.adCountThreshold) {
+      try {
+        const LotteryTicket = require('../models/LotteryTicket');
         const LotteryHistory = require('../models/LotteryHistory');
+
         const latestHistory = await LotteryHistory.findOne(
           { issueNumber: { $regex: /^\d+$/ } }
         ).sort({ drawTime: -1 });
-        
+
         if (latestHistory) {
           const latestIssueNumber = parseInt(latestHistory.issueNumber);
           issueNumber = (latestIssueNumber + 1).toString();
         } else {
           issueNumber = '1';
         }
-        
-        // 生成6位随机数字奖券号码
-        function generateTicketNumber() {
-          return Math.floor(100000 + Math.random() * 900000).toString();
-        }
-        
-        ticketNumber = generateTicketNumber();
-        
-        // 计算有效期（下一次开奖时间）
+
+        ticketNumber = Math.floor(100000 + Math.random() * 900000).toString();
+
         const validUntil = new Date();
         const [hours, minutes] = settings.drawTime.split(':').map(Number);
         validUntil.setHours(hours, minutes, 0, 0);
-        
-        // 如果当前时间已经过了今天的开奖时间，则设置为明天的开奖时间
         if (validUntil <= new Date()) {
           validUntil.setDate(validUntil.getDate() + 1);
         }
-        
-        // 创建奖券
+
         const ticket = new LotteryTicket({
           userId,
           employeeId,
@@ -109,39 +155,41 @@ router.post('/reward', async (req, res) => {
           issueNumber,
           validUntil
         });
-        
+
         await ticket.save();
-        
-        // 重置广告次数
         userGold.adCount = 0;
+      } catch (err) {
+        console.error('生成奖券错误:', err);
       }
-    } catch (err) {
-      console.error('生成奖券错误:', err);
-      // 即使生成奖券失败，也继续发放金币
     }
-    
+
     await userGold.save();
-    
-    // 记录金币日志（使用当前UTC时间，但确保在查询时正确处理）
+
+    // 记录金币日志
     let groupCommissionRate = 0;
-    
-    // 尝试查询员工所在组的提成比例
+
+    // 员工组别提成查询（带缓存）
     try {
       const Employee = require('../models/Employee');
       const TeamGroup = require('../models/TeamGroup');
-      
-      const employee = await Employee.findOne({ employeeId });
-      if (employee && employee.teamGroupId) {
-        const group = await TeamGroup.findById(employee.teamGroupId);
-        if (group) {
-          groupCommissionRate = group.commission;
+
+      const cachedCommission = getEmployeeGroupCache(employeeId);
+      if (cachedCommission !== null) {
+        groupCommissionRate = cachedCommission;
+      } else {
+        const employee = await Employee.findOne({ employeeId });
+        if (employee && employee.teamGroupId) {
+          const group = await TeamGroup.findById(employee.teamGroupId);
+          if (group) {
+            groupCommissionRate = group.commission;
+            setEmployeeGroupCache(employeeId, group.commission);
+          }
         }
       }
     } catch (err) {
       console.error('查询员工和组信息错误:', err);
-      // 即使查询失败，也继续发放金币
     }
-    
+
     const goldLog = new GoldLog({
       userId,
       employeeId,
@@ -152,32 +200,24 @@ router.post('/reward', async (req, res) => {
       commissionRate: groupCommissionRate,
       createTime: new Date()
     });
-    
+
     await goldLog.save();
-    
+
     // 计算并添加到红包池
-    const SystemConfig = require('../models/SystemConfig');
-    const injectRateConfig = await SystemConfig.findOne({ key: 'redPacketInjectRate' }) || { value: 0.025 };
-    const redPacketAmount = gold * injectRateConfig.value;
-    
-    // 更新红包池
+    let injectRate = await getConfig('redPacketInjectRate');
+    if (injectRate === null) injectRate = 0.025;
+    const redPacketAmount = gold * injectRate;
+
     let redPacketPoolConfig = await SystemConfig.findOne({ key: 'redPacketPool' });
     if (!redPacketPoolConfig) {
       redPacketPoolConfig = new SystemConfig({ key: 'redPacketPool', value: 0 });
     }
     redPacketPoolConfig.value += redPacketAmount;
     await redPacketPoolConfig.save();
-    
-    // 计算并添加到奖金池
-    const LotterySettings = require('../models/LotterySettings');
-    let settings = await LotterySettings.findOne();
-    if (!settings) {
-      settings = new LotterySettings();
-      await settings.save();
-    }
+
+    // 计算并添加到奖金池（使用之前缓存的 settings）
     const lotteryAmount = gold * settings.poolPercentage;
-    
-    // 更新奖金池
+
     const LotteryPool = require('../models/LotteryPool');
     let lotteryPool = await LotteryPool.findOne();
     if (!lotteryPool) {
@@ -186,16 +226,16 @@ router.post('/reward', async (req, res) => {
     lotteryPool.currentAmount += lotteryAmount;
     lotteryPool.totalAmount += lotteryAmount;
     await lotteryPool.save();
-    
-    res.json({ 
-      success: true, 
-      message: '金币发放成功', 
-      data: { 
-        gold, 
+
+    res.json({
+      success: true,
+      message: '金币发放成功',
+      data: {
+        gold,
         currentMonthGold: userGold.currentMonthGold,
         ticketNumber,
         issueNumber
-      } 
+      }
     });
   } catch (error) {
     console.error('发金币错误:', error);

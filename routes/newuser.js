@@ -7,6 +7,7 @@ const Team = require('../models/Team');
 const Admin = require('../models/Admin');
 const UserActivity = require('../models/UserActivity');
 const authMiddleware = require('../middleware/auth');
+const { get, set } = require('../utils/cache');
 
 // 获取北京时间
 function getBeijingDate() {
@@ -49,6 +50,23 @@ router.get('/list', authMiddleware, async (req, res) => {
     // 获取当前管理员信息
     const currentAdmin = await Admin.findOne({ username });
     
+    // 构建缓存键
+    let cacheKey = `newuser_list_${page}_${pageSize}`;
+    if (currentAdmin) {
+      const role = String(currentAdmin.role).toUpperCase();
+      if (role === 'ADMIN_MANAGER') {
+        const managedIds = currentAdmin.managedTeamIds || [];
+        cacheKey += `_admin_${managedIds.length > 0 ? managedIds.sort().join('_') : 'empty'}`;
+      } else if (role !== 'SUPER_ADMIN') {
+        cacheKey += `_user_${currentAdmin._id}`;
+      }
+    }
+    
+    const cached = get(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+    
     // 构建查询条件
     const query = {
       createdAt: { $gte: fifteenDaysAgo },
@@ -56,9 +74,34 @@ router.get('/list', authMiddleware, async (req, res) => {
     };
     
     // 如果不是系统管理员，只显示自己团队的新人
-    if (currentAdmin && currentAdmin.role !== 'SUPER_ADMIN') {
-      // 查找所有parentId为当前管理员的员工
-      query.parentId = currentAdmin._id;
+    if (currentAdmin) {
+      const role = String(currentAdmin.role).toUpperCase();
+      if (role !== 'SUPER_ADMIN') {
+        if (role === 'ADMIN_MANAGER') {
+          // 高管：显示自己管理的所有团队长及其下属的员工
+          const managedIds = currentAdmin.managedTeamIds || [];
+          if (managedIds.length === 0) {
+            // 高管未分配团队，直接返回空数据
+            return res.json({
+              success: true,
+              todayNewUsers: 0,
+              list: [],
+              pagination: {
+                total: 0,
+                page: parseInt(page),
+                pageSize: parseInt(pageSize)
+              }
+            });
+          }
+          query.$or = [
+            { parentId: { $in: managedIds } },
+            { teamId: { $in: managedIds } }
+          ];
+        } else {
+          // 团队长/组长：只显示自己团队的员工
+          query.parentId = currentAdmin._id;
+        }
+      }
     }
     
     const total = await Employee.countDocuments(query);
@@ -74,8 +117,19 @@ router.get('/list', authMiddleware, async (req, res) => {
       $or: [{ status: 'enabled' }, { status: 1 }, { status: { $exists: false } }]
     };
     
-    if (currentAdmin && currentAdmin.role !== 'SUPER_ADMIN') {
-      todayQuery.parentId = currentAdmin._id;
+    if (currentAdmin) {
+      const role = String(currentAdmin.role).toUpperCase();
+      if (role !== 'SUPER_ADMIN') {
+        if (role === 'ADMIN_MANAGER') {
+          const managedIds = currentAdmin.managedTeamIds || [];
+          todayQuery.$or = [
+            { parentId: { $in: managedIds } },
+            { teamId: { $in: managedIds } }
+          ];
+        } else {
+          todayQuery.parentId = currentAdmin._id;
+        }
+      }
     }
     
     const todayNewUsers = await Employee.countDocuments(todayQuery);
@@ -114,12 +168,15 @@ router.get('/list', authMiddleware, async (req, res) => {
       const userGold = userGoldMap[employee.employeeId] || {};
       const userId = userGold.userId || '';
       
-      // 查询金币记录
-      const goldLogs = await GoldLog.find({ userId });
-      const watched = goldLogs.length;
-      const earnings = goldLogs.reduce((sum, log) => sum + log.gold, 0);
-      const totalEcpm = goldLogs.reduce((sum, log) => sum + (log.ecpm || 0), 0);
-      const ecpm = watched > 0 ? totalEcpm / watched : 0;
+      // 查询金币记录（使用聚合避免全量拉取）
+      const goldStats = await GoldLog.aggregate([
+        { $match: { userId } },
+        { $group: { _id: null, count: { $sum: 1 }, totalGold: { $sum: '$gold' }, totalEcpm: { $sum: { $ifNull: ['$ecpm', 0] } } } }
+      ]);
+      const stats = goldStats[0] || { count: 0, totalGold: 0, totalEcpm: 0 };
+      const watched = stats.count;
+      const earnings = stats.totalGold;
+      const ecpm = watched > 0 ? stats.totalEcpm / watched : 0;
       
       // 查询IP和设备数量
       const ipList = await UserActivity.distinct('ip', { userId });
@@ -158,14 +215,20 @@ router.get('/list', authMiddleware, async (req, res) => {
     
     // 过滤数据：如果不是系统管理员，只显示superior匹配的新人
     let filteredUsers = usersWithDetails;
-    if (currentAdmin && currentAdmin.role !== 'SUPER_ADMIN') {
-      // 获取当前管理员的显示名称（teamName或realName或username）
-      const currentAdminName = currentAdmin.teamName || currentAdmin.realName || currentAdmin.username;
-      // 过滤出superior匹配的员工
-      filteredUsers = usersWithDetails.filter(user => user.superior === currentAdminName);
+    if (currentAdmin) {
+      const role = String(currentAdmin.role).toUpperCase();
+      if (role !== 'SUPER_ADMIN') {
+        if (role === 'ADMIN_MANAGER') {
+          // 高管：已经在数据库查询时过滤了，这里不过滤
+        } else {
+          // 团队长/组长：只显示superior匹配的员工
+          const currentAdminName = currentAdmin.teamName || currentAdmin.realName || currentAdmin.username;
+          filteredUsers = usersWithDetails.filter(user => user.superior === currentAdminName);
+        }
+      }
     }
     
-    res.json({
+    const result = {
       success: true,
       todayNewUsers: todayNewUsers,
       list: filteredUsers,
@@ -174,7 +237,12 @@ router.get('/list', authMiddleware, async (req, res) => {
         page: parseInt(page),
         pageSize: parseInt(pageSize)
       }
-    });
+    };
+    
+    // 缓存5分钟
+    set(cacheKey, result, 5 * 60 * 1000);
+    
+    res.json(result);
   } catch (error) {
     console.error('获取新用户列表错误:', error);
     res.status(500).json({ success: false, message: '服务器错误' });

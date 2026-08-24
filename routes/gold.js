@@ -5,12 +5,7 @@ const GoldLog = require('../models/GoldLog');
 const GoldDeduction = require('../models/GoldDeduction');
 const SystemConfig = require('../models/SystemConfig');
 const authMiddleware = require('../middleware/auth');
-
-// 获取北京时间
-function getBeijingDate() {
-  const now = new Date();
-  return new Date(now.getTime() + 8 * 60 * 60 * 1000);
-}
+const { getBeijingDate } = require('../utils/date');
 
 // 系统配置缓存
 const configCache = {
@@ -24,6 +19,11 @@ const CONFIG_CACHE_TTL = 10000; // 10秒缓存（commissionRate一天变几十�
 let lotterySettingsCache = null;
 let lotterySettingsCacheTime = 0;
 const LOTTERY_SETTINGS_CACHE_TTL = 60000; // 60秒
+
+// WelfareSettings 缓存
+let welfareSettingsCache = null;
+let welfareSettingsCacheTime = 0;
+const WELFARE_SETTINGS_CACHE_TTL = 60000; // 60秒
 
 // 员工组别提成缓存
 const employeeGroupCache = new Map();
@@ -71,6 +71,28 @@ async function getConfig(key) {
   return null;
 }
 
+// 获取福利设置（带缓存）
+async function getWelfareSettings() {
+  const now = Date.now();
+  if (welfareSettingsCache && (now - welfareSettingsCacheTime) < WELFARE_SETTINGS_CACHE_TTL) {
+    return welfareSettingsCache;
+  }
+  try {
+    const WelfareSettings = require('../models/WelfareSettings');
+    let settings = await WelfareSettings.findOne();
+    if (!settings) {
+      settings = new WelfareSettings();
+      await settings.save();
+    }
+    welfareSettingsCache = settings;
+    welfareSettingsCacheTime = now;
+    return settings;
+  } catch (err) {
+    console.error('获取福利设置错误:', err);
+    return null;
+  }
+}
+
 // 上报ECPM发金币
 router.post('/reward', async (req, res) => {
   try {
@@ -80,9 +102,22 @@ router.post('/reward', async (req, res) => {
       return res.status(400).json({ success: false, message: '缺少必要参数' });
     }
 
-    // 获取分成比例（默认50%），使用缓存
-    let commissionRate = await getConfig('commissionRate');
-    if (commissionRate === null) commissionRate = 0.5;
+    let platform = '';
+    if (slotId && /^10\d{6,10}$/.test(slotId)) {
+      platform = 'csj';
+    }
+
+    // 穿山甲（csj）固定分成比例 40%（硬编码，不走 SystemConfig.commissionRate）
+    // 其他平台（百度/快手/优量汇等）仍按 SystemConfig.commissionRate，默认兜底 50%
+    // 若后续需要调整穿山甲分成比例，改此处常量 CSJ_FIXED_COMMISSION_RATE 即可
+    const CSJ_FIXED_COMMISSION_RATE = 0.4;
+    let commissionRate;
+    if (platform === 'csj') {
+      commissionRate = CSJ_FIXED_COMMISSION_RATE;
+    } else {
+      commissionRate = await getConfig('commissionRate');
+      if (commissionRate === null) commissionRate = 0.5;
+    }
 
     // 获取彩票设置（带缓存，只查一次）
     const LotterySettings = require('../models/LotterySettings');
@@ -104,6 +139,7 @@ router.post('/reward', async (req, res) => {
 
     // 更新用户金币和广告次数
     let userGold = await UserGold.findOne({ userId });
+    let shouldGenerateTicket = false;
 
     if (!userGold) {
       userGold = new UserGold({
@@ -113,16 +149,33 @@ router.post('/reward', async (req, res) => {
         lastMonthGold: 0,
         adCount: 1
       });
+      shouldGenerateTicket = 1 >= settings.adCountThreshold;
     } else {
-      userGold.currentMonthGold += gold;
-      userGold.adCount += 1;
+      const newAdCount = userGold.adCount + 1;
+      shouldGenerateTicket = newAdCount >= settings.adCountThreshold;
+      
+      if (shouldGenerateTicket) {
+        await UserGold.updateOne(
+          { userId },
+          { $inc: { currentMonthGold: gold }, $set: { adCount: 0 } }
+        );
+        userGold.currentMonthGold += gold;
+        userGold.adCount = 0;
+      } else {
+        await UserGold.updateOne(
+          { userId },
+          { $inc: { currentMonthGold: gold, adCount: 1 } }
+        );
+        userGold.currentMonthGold += gold;
+        userGold.adCount = newAdCount;
+      }
     }
 
     // 检查是否达到广告次数阈值，生成奖券
     let ticketNumber = null;
     let issueNumber = null;
 
-    if (userGold.adCount >= settings.adCountThreshold) {
+    if (shouldGenerateTicket) {
       try {
         const LotteryTicket = require('../models/LotteryTicket');
         const LotteryHistory = require('../models/LotteryHistory');
@@ -157,39 +210,21 @@ router.post('/reward', async (req, res) => {
         });
 
         await ticket.save();
-        userGold.adCount = 0;
       } catch (err) {
         console.error('生成奖券错误:', err);
       }
     }
 
-    await userGold.save();
-
-    // 记录金币日志
-    let groupCommissionRate = 0;
-
-    // 员工组别提成查询（带缓存）
-    try {
-      const Employee = require('../models/Employee');
-      const TeamGroup = require('../models/TeamGroup');
-
-      const cachedCommission = getEmployeeGroupCache(employeeId);
-      if (cachedCommission !== null) {
-        groupCommissionRate = cachedCommission;
-      } else {
-        const employee = await Employee.findOne({ employeeId });
-        if (employee && employee.teamGroupId) {
-          const group = await TeamGroup.findById(employee.teamGroupId);
-          if (group) {
-            groupCommissionRate = group.commission;
-            setEmployeeGroupCache(employeeId, group.commission);
-          }
-        }
-      }
-    } catch (err) {
-      console.error('查询员工和组信息错误:', err);
+    if (!userGold._id || userGold.isNew) {
+      await userGold.save();
     }
 
+    // ✅ 记录金币流水：3个分账字段（commissionRate / tlCommissionRate / parentTlCommissionRate）
+    //    完全交给 GoldLog.pre('save') 钩子统一固化：
+    //    - 查 Admin(groupLeaderId).commission（组长晋升后的新职级值，不依赖TeamGroup.commission老值）
+    //    - 兼容 teamGroupId 存组长Admin._id的老存储（groupLeaderId fallback查询）
+    //    - 平级/倒挂 上级保底2%、2级封顶、G不沾上级上级等复杂规则
+    //    【禁止】在此处手动传 commissionRate/tlCommissionRate/parentTlCommissionRate，避免与固化逻辑冲突、错发漏发。
     const goldLog = new GoldLog({
       userId,
       employeeId,
@@ -197,35 +232,109 @@ router.post('/reward', async (req, res) => {
       ecpm,
       gold,
       slotId: slotId || '',
-      commissionRate: groupCommissionRate,
+      platform: platform || '',
       createTime: new Date()
     });
 
     await goldLog.save();
 
-    // 计算并添加到红包池
+    // 计算并添加到红包池（使用 upsert 原子操作）
     let injectRate = await getConfig('redPacketInjectRate');
     if (injectRate === null) injectRate = 0.025;
     const redPacketAmount = gold * injectRate;
 
-    let redPacketPoolConfig = await SystemConfig.findOne({ key: 'redPacketPool' });
-    if (!redPacketPoolConfig) {
-      redPacketPoolConfig = new SystemConfig({ key: 'redPacketPool', value: 0 });
-    }
-    redPacketPoolConfig.value += redPacketAmount;
-    await redPacketPoolConfig.save();
+    await SystemConfig.findOneAndUpdate(
+      { key: 'redPacketPool' },
+      { 
+        $inc: { value: redPacketAmount },
+        $setOnInsert: { key: 'redPacketPool' }
+      },
+      { upsert: true, new: true }
+    );
 
-    // 计算并添加到奖金池（使用之前缓存的 settings）
+    // 计算并添加到奖金池（使用 upsert 原子操作）
     const lotteryAmount = gold * settings.poolPercentage;
 
     const LotteryPool = require('../models/LotteryPool');
-    let lotteryPool = await LotteryPool.findOne();
-    if (!lotteryPool) {
-      lotteryPool = new LotteryPool();
+    await LotteryPool.findOneAndUpdate(
+      {},
+      {
+        $inc: { currentAmount: lotteryAmount, totalAmount: lotteryAmount },
+        $setOnInsert: {}
+      },
+      { upsert: true, new: true }
+    );
+
+    // ===== 福利钱包抽奖机会逻辑 =====
+    try {
+      const WelfareWallet = require('../models/WelfareWallet');
+      
+      // 获取今天的日期（北京时间）
+      const now = new Date();
+      const offset = 8 * 60 * 60 * 1000; // 北京时间UTC+8偏移量
+      const beijingTime = new Date(now.getTime() + offset);
+      const todayStr = beijingTime.toISOString().split('T')[0];
+      
+      // 获取福利配置（使用缓存）
+      let welfareSettings = await getWelfareSettings();
+      if (!welfareSettings) {
+        welfareSettings = { thresholds: [] }; // 默认配置
+      }
+      
+      // 使用 upsert 原子操作更新福利钱包（避免先查询再保存的两次数据库操作）
+      const updateResult = await WelfareWallet.findOneAndUpdate(
+        { userId, employeeId },
+        {
+          $setOnInsert: {
+            userId,
+            employeeId,
+            balance: 0,
+            chances: 0,
+            todayAdCount: 0,
+            lastAwardedThresholdIndex: -1,
+            countDate: todayStr
+          },
+          $set: {
+            countDate: todayStr
+          },
+          $inc: {
+            todayAdCount: 1
+          }
+        },
+        { upsert: true, new: true }
+      );
+      
+      // 检查是否需要重置每日计数
+      const currentAdCount = updateResult.todayAdCount;
+      const lastThresholdIndex = updateResult.lastAwardedThresholdIndex;
+      
+      // 检查是否达到阈值，发放抽奖机会
+      const thresholds = welfareSettings.thresholds || [];
+      let totalNewChances = 0;
+      let newThresholdIndex = lastThresholdIndex;
+      
+      for (let i = 0; i < thresholds.length; i++) {
+        const threshold = thresholds[i];
+        if (i > lastThresholdIndex && currentAdCount >= threshold.adCount) {
+          totalNewChances += threshold.giveChances;
+          newThresholdIndex = i;
+        }
+      }
+      
+      // 如果有新发放的抽奖机会，更新钱包
+      if (totalNewChances > 0) {
+        await WelfareWallet.updateOne(
+          { userId, employeeId },
+          { 
+            $inc: { chances: totalNewChances },
+            $set: { lastAwardedThresholdIndex: newThresholdIndex }
+          }
+        );
+      }
+    } catch (welfareError) {
+      console.error('福利钱包处理错误:', welfareError);
     }
-    lotteryPool.currentAmount += lotteryAmount;
-    lotteryPool.totalAmount += lotteryAmount;
-    await lotteryPool.save();
+    // ===== 福利钱包抽奖机会逻辑结束 =====
 
     res.json({
       success: true,

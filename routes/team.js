@@ -6,67 +6,28 @@ const GoldLog = require('../models/GoldLog');
 const LoginRecord = require('../models/LoginRecord');
 const Employee = require('../models/Employee');
 const authMiddleware = require('../middleware/auth');
+const { getBeijingDate, getBeijingStartOfDay, getBeijingDateString, getYesterdayStart, getYesterdayEnd, getMonthStart, getMonthEnd } = require('../utils/date');
 
 const listCache = new Map();
-const LIST_CACHE_TTL = 30 * 1000;
+const LIST_CACHE_TTL = 5 * 60 * 1000;  // 5分钟（原30秒）
 
 const memberDetailCache = new Map();
-const MEMBER_CACHE_TTL = 10 * 1000;
-
-function getBeijingDate() {
-  const now = new Date();
-  return new Date(now.getTime() + 8 * 60 * 60 * 1000);
-}
-
-function getBeijingStartOfDay() {
-  const beijingNow = getBeijingDate();
-  const startOfDay = new Date(beijingNow);
-  startOfDay.setHours(0, 0, 0, 0);
-  return startOfDay;
-}
+const MEMBER_CACHE_TTL = 3 * 60 * 1000; // 3分钟（原10秒）
 
 function getBeijingStartOfMonth() {
-  const beijingNow = getBeijingDate();
-  const startOfMonth = new Date(beijingNow);
-  startOfMonth.setDate(1);
-  startOfMonth.setHours(0, 0, 0, 0);
-  return startOfMonth;
-}
-
-function getYesterdayStart() {
-  const beijingNow = getBeijingDate();
-  const startOfYesterday = new Date(beijingNow);
-  startOfYesterday.setDate(startOfYesterday.getDate() - 1);
-  startOfYesterday.setHours(0, 0, 0, 0);
-  return new Date(startOfYesterday.getTime() - 8 * 60 * 60 * 1000);
-}
-
-function getYesterdayEnd() {
-  const beijingNow = getBeijingDate();
-  const startOfToday = new Date(beijingNow);
-  startOfToday.setHours(0, 0, 0, 0);
-  return new Date(startOfToday.getTime() - 8 * 60 * 60 * 1000);
+  return getMonthStart();
 }
 
 function getLastMonthStart() {
-  const beijingNow = getBeijingDate();
-  const startOfLastMonth = new Date(beijingNow);
-  startOfLastMonth.setMonth(startOfLastMonth.getMonth() - 1);
-  startOfLastMonth.setDate(1);
-  startOfLastMonth.setHours(0, 0, 0, 0);
-  return new Date(startOfLastMonth.getTime() - 8 * 60 * 60 * 1000);
+  const date = new Date();
+  date.setMonth(date.getMonth() - 1);
+  return getMonthStart(date);
 }
 
 function getLastMonthEnd() {
-  const beijingNow = getBeijingDate();
-  const endOfLastMonth = new Date(beijingNow);
-  endOfLastMonth.setDate(0);
-  endOfLastMonth.setHours(23, 59, 59, 999);
-  return new Date(endOfLastMonth.getTime() - 8 * 60 * 60 * 1000);
-}
-
-function getBeijingDateString() {
-  return getBeijingDate().toISOString().split('T')[0];
+  const date = new Date();
+  date.setMonth(date.getMonth() - 1);
+  return getMonthEnd(date);
 }
 
 function getCache(key, cacheMap, ttl) {
@@ -88,7 +49,26 @@ function setCache(key, data, cacheMap, ttl) {
 router.get('/list', authMiddleware, async (req, res) => {
   try {
     const { search, sortBy = 'todayRevenue' } = req.query;
-    const cacheKey = `team_list_${search || ''}_${sortBy}`;
+    
+    const role = req.user?.role;
+    const isSuper = role === 'superadmin' || String(role).toUpperCase() === 'SUPER_ADMIN';
+    const isAdminManager = String(role).toUpperCase() === 'ADMIN_MANAGER';
+    
+    let scopeTeamIds = [];
+    let scopeHash = 'super';
+    
+    if (isAdminManager) {
+      const Admin = require('../models/Admin');
+      const admin = await Admin.findById(req.user.id).select('managedTeamIds').lean();
+      scopeTeamIds = admin?.managedTeamIds?.map(id => String(id)) || [];
+      scopeHash = scopeTeamIds.length > 0 
+        ? `admin_${scopeTeamIds.sort().join('_')}` 
+        : `admin_empty`;
+    } else if (!isSuper && req.user) {
+      scopeHash = `user_${req.user.id}`;
+    }
+    
+    const cacheKey = `team_list_${search || ''}_${sortBy}_${scopeHash}`;
 
     const cached = getCache(cacheKey, listCache, LIST_CACHE_TTL);
     if (cached) {
@@ -98,6 +78,16 @@ router.get('/list', authMiddleware, async (req, res) => {
     let query = {};
     if (search) {
       query.name = { $regex: search, $options: 'i' };
+    }
+    
+    if (isAdminManager && scopeTeamIds.length > 0) {
+      query.leaderId = { $in: scopeTeamIds };
+    }
+    
+    if (isAdminManager && scopeTeamIds.length === 0) {
+      const result = { success: true, data: [] };
+      setCache(cacheKey, result, listCache, LIST_CACHE_TTL);
+      return res.json(result);
     }
 
     const teams = await Team.find(query);
@@ -120,39 +110,35 @@ router.get('/list', authMiddleware, async (req, res) => {
 
     const allEmployeeIds = [...new Set(allEmployees.map(e => e.employeeId))];
 
-    const todayGoldAgg = await GoldLog.aggregate([
-      { $match: { employeeId: { $in: allEmployeeIds }, createTime: { $gte: todayStart } } },
-      { $group: { _id: '$employeeId', todayGold: { $sum: '$gold' }, todayCount: { $sum: 1 } } }
-    ]);
-
-    const monthGoldAgg = await GoldLog.aggregate([
-      { $match: { employeeId: { $in: allEmployeeIds }, createTime: { $gte: monthStart } } },
-      { $group: { _id: '$employeeId', monthGold: { $sum: '$gold' }, monthCount: { $sum: 1 } } }
-    ]);
-
-    const yesterdayGoldAgg = await GoldLog.aggregate([
-      { $match: { employeeId: { $in: allEmployeeIds }, createTime: { $gte: yesterdayStart, $lt: yesterdayEnd } } },
-      { $group: { _id: '$employeeId', yesterdayGold: { $sum: '$gold' } } }
-    ]);
-
-    const lastMonthGoldAgg = await GoldLog.aggregate([
-      { $match: { employeeId: { $in: allEmployeeIds }, createTime: { $gte: lastMonthStart, $lte: lastMonthEnd } } },
-      { $group: { _id: '$employeeId', lastMonthGold: { $sum: '$gold' } } }
-    ]);
-
-    const totalGoldAgg = await GoldLog.aggregate([
-      { $match: { employeeId: { $in: allEmployeeIds } } },
-      { $group: { _id: '$employeeId', totalGold: { $sum: '$gold' }, totalCount: { $sum: 1 }, totalEcpm: { $sum: { $ifNull: ['$ecpm', 0] } } } }
-    ]);
-
-    const todayLoginAgg = await LoginRecord.aggregate([
-      { $match: { employeeId: { $in: allEmployeeIds }, loginDate: { $gte: todayStart } } },
-      { $group: { _id: '$employeeId', count: { $sum: 1 } } }
-    ]);
-
-    const monthLoginAgg = await LoginRecord.aggregate([
-      { $match: { employeeId: { $in: allEmployeeIds }, loginDate: { $gte: monthStart } } },
-      { $group: { _id: '$employeeId', count: { $sum: 1 } } }
+    const [todayGoldAgg, monthGoldAgg, yesterdayGoldAgg, lastMonthGoldAgg, totalGoldAgg, todayLoginAgg, monthLoginAgg] = await Promise.all([
+      GoldLog.aggregate([
+        { $match: { employeeId: { $in: allEmployeeIds }, createTime: { $gte: todayStart } } },
+        { $group: { _id: '$employeeId', todayGold: { $sum: '$gold' }, todayCount: { $sum: 1 } } }
+      ]),
+      GoldLog.aggregate([
+        { $match: { employeeId: { $in: allEmployeeIds }, createTime: { $gte: monthStart } } },
+        { $group: { _id: '$employeeId', monthGold: { $sum: '$gold' }, monthCount: { $sum: 1 } } }
+      ]),
+      GoldLog.aggregate([
+        { $match: { employeeId: { $in: allEmployeeIds }, createTime: { $gte: yesterdayStart, $lt: yesterdayEnd } } },
+        { $group: { _id: '$employeeId', yesterdayGold: { $sum: '$gold' } } }
+      ]),
+      GoldLog.aggregate([
+        { $match: { employeeId: { $in: allEmployeeIds }, createTime: { $gte: lastMonthStart, $lte: lastMonthEnd } } },
+        { $group: { _id: '$employeeId', lastMonthGold: { $sum: '$gold' } } }
+      ]),
+      GoldLog.aggregate([
+        { $match: { employeeId: { $in: allEmployeeIds } } },
+        { $group: { _id: '$employeeId', totalGold: { $sum: '$gold' }, totalCount: { $sum: 1 }, totalEcpm: { $sum: { $ifNull: ['$ecpm', 0] } } } }
+      ]),
+      LoginRecord.aggregate([
+        { $match: { employeeId: { $in: allEmployeeIds }, loginDate: { $gte: todayStart } } },
+        { $group: { _id: '$employeeId', count: { $sum: 1 } } }
+      ]),
+      LoginRecord.aggregate([
+        { $match: { employeeId: { $in: allEmployeeIds }, loginDate: { $gte: monthStart } } },
+        { $group: { _id: '$employeeId', count: { $sum: 1 } } }
+      ])
     ]);
 
     const empStatsMap = {};
@@ -275,19 +261,19 @@ router.get('/members', authMiddleware, async (req, res) => {
     const todayStart = getBeijingStartOfDay(beijingNow);
     const monthStart = getBeijingStartOfMonth();
 
-    const todayGoldAgg = await GoldLog.aggregate([
-      { $match: { userId: { $in: memberUserIds }, createTime: { $gte: todayStart } } },
-      { $group: { _id: '$userId', todayGold: { $sum: '$gold' }, todayCount: { $sum: 1 } } }
-    ]);
-
-    const monthGoldAgg = await GoldLog.aggregate([
-      { $match: { userId: { $in: memberUserIds }, createTime: { $gte: monthStart } } },
-      { $group: { _id: '$userId', monthGold: { $sum: '$gold' }, monthCount: { $sum: 1 } } }
-    ]);
-
-    const totalGoldAgg = await GoldLog.aggregate([
-      { $match: { userId: { $in: memberUserIds } } },
-      { $group: { _id: '$userId', totalGold: { $sum: '$gold' }, totalCount: { $sum: 1 } } }
+    const [todayGoldAgg, monthGoldAgg, totalGoldAgg] = await Promise.all([
+      GoldLog.aggregate([
+        { $match: { userId: { $in: memberUserIds }, createTime: { $gte: todayStart } } },
+        { $group: { _id: '$userId', todayGold: { $sum: '$gold' }, todayCount: { $sum: 1 } } }
+      ]),
+      GoldLog.aggregate([
+        { $match: { userId: { $in: memberUserIds }, createTime: { $gte: monthStart } } },
+        { $group: { _id: '$userId', monthGold: { $sum: '$gold' }, monthCount: { $sum: 1 } } }
+      ]),
+      GoldLog.aggregate([
+        { $match: { userId: { $in: memberUserIds } } },
+        { $group: { _id: '$userId', totalGold: { $sum: '$gold' }, totalCount: { $sum: 1 } } }
+      ])
     ]);
 
     const userStatsMap = {};

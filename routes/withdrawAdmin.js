@@ -98,10 +98,11 @@ router.post('/:id/reject', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, message: '该提现已拒绝' });
     }
     
-    // 如果之前是通过状态，需要退还金币
+    // 如果之前是通过或待处理状态，需要退还金币
     if (record.status === 1 || record.status === 0) {
+      // 统一用 employeeId 查找，避免 userId 字段不一致的问题
       await UserGold.updateOne(
-        { userId: record.userId, employeeId: record.employeeId },
+        { employeeId: record.employeeId },
         { $inc: { lastMonthGold: record.goldAmount } }
       );
     }

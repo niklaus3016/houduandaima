@@ -4,7 +4,7 @@ const cors = require('cors');
 const employeeRoutes = require('./routes/employee');
 const userRoutes = require('./routes/user');
 const goldRoutes = require('./routes/gold');
-const adminRoutes = require('./routes/admin');
+const { router: adminRoutes, _prewarmEcpmCache } = require('./routes/admin');
 const dashboardRoutes = require('./routes/dashboard');
 const teamRoutes = require('./routes/team');
 const accountRoutes = require('./routes/account');
@@ -32,12 +32,16 @@ const teamMembersRoutes = require('./routes/teamMembers');
 const weeklyTargetRoutes = require('./routes/weeklyTarget');
 const weeklyBonusRoutes = require('./routes/weeklyBonus');
 const welfareRoutes = require('./routes/welfare');
+const dailyGuaranteeRoutes = require('./routes/welfare/dailyGuarantee');
 const rankingRoutes = require('./routes/ranking');
+const supervisorManageRoutes = require('./routes/supervisorManage');
+const downloadRoutes = require('./routes/download');
+const adRoutes = require('./routes/ad');
 
 
 const app = express();
 const PORT = process.env.PORT || 3003;
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://root:9yx7pAD9851A7W7Q@lzjzb-sjk-mongodb.ns-tlwyfho9.svc:27017';
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://root:9yx7pAD9851A7W7Q@lzjzb-sjk-mongodb.ns-tlwyfho9.svc:27017/test?authSource=admin&replicaSet=lzjzb-sjk-mongodb';
 
 // 中间件
 app.use(cors());
@@ -88,20 +92,27 @@ app.use('/api', verificationRoutes);
 app.use('/api', welfareRoutes);
 app.use('/api/weeklyTarget', weeklyTargetRoutes);
 app.use('/api/weeklyBonus', weeklyBonusRoutes);
+app.use('/api/welfare/daily-guarantee', dailyGuaranteeRoutes);
 app.use('/api/ranking', rankingRoutes);
 app.use('/api/admin/team-performance', teamPerformanceRoutes);
 app.use('/api/admin/dashboard', teamMembersRoutes);
+app.use('/api/admin/supervisor', supervisorManageRoutes);
+app.use('/api/download', downloadRoutes);
+app.use('/api/ad', adRoutes);
 
-// 连接MongoDB
+// 连接MongoDB（副本集，读写分离）
 mongoose.connect(MONGODB_URI, {
   maxPoolSize: 100,
   minPoolSize: 10,
   serverSelectionTimeoutMS: 5000,
   socketTimeoutMS: 30000,
   connectTimeoutMS: 5000,
+  readPreference: 'secondaryPreferred',
 })
-  .then(() => {
+  .then(async () => {
     console.log('MongoDB连接成功');
+    
+    await _prewarmEcpmCache();
     
     // 移除自动开奖监控，所有开奖由超管手动控制
     

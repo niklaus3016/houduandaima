@@ -29,6 +29,16 @@ const teamGroupSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  // 组状态：'active'（默认，正常）/ 'disbanded'（组长晋升为TL后解散，不再使用）
+  status: {
+    type: String,
+    default: 'active'
+  },
+  // 组解散时间（组长晋升为TL时由晋升接口写入）
+  dissolvedAt: {
+    type: Date,
+    default: null
+  },
   createdAt: {
     type: Date,
     default: Date.now

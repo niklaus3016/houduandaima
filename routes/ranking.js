@@ -1,9 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const GoldLog = require('../models/GoldLog');
+const { CACHE_TTL } = require('../utils/cache');
 
 const cache = new Map();
-const CACHE_TTL = 60 * 1000; // 60秒
 
 function getBeijingDate(date = new Date()) {
   return new Date(date.getTime() + 8 * 60 * 60 * 1000);
@@ -21,7 +21,7 @@ function getFromCache(key) {
 function setCache(key, data) {
   cache.set(key, {
     data,
-    expiry: Date.now() + CACHE_TTL
+    expiry: Date.now() + CACHE_TTL.ranking
   });
 }
 
@@ -201,6 +201,81 @@ router.get('/month-top-daily', async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('获取本月单日最高收益错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// 昨日收益排行榜 - 每天00:00更新，缓存24小时
+router.get('/yesterday-ranking', async (req, res) => {
+  try {
+    const beijingNow = getBeijingDate();
+    // 获取昨天的日期字符串作为缓存键的一部分（格式：yyyy-MM-dd）
+    const yesterdayDate = new Date(beijingNow);
+    yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+    const dateStr = yesterdayDate.toISOString().split('T')[0];
+    const cacheKey = `yesterday-ranking-${dateStr}`;
+
+    // 尝试从缓存获取
+    const cached = getFromCache(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    // 计算昨天的时间范围（北京时间）
+    const yesterdayStart = getYesterdayStart(beijingNow);
+    const yesterdayEnd = getBeijingStartOfDay(beijingNow);
+
+    const aggregation = await GoldLog.aggregate([
+      {
+        $match: {
+          createTime: { $gte: yesterdayStart, $lt: yesterdayEnd }
+        }
+      },
+      {
+        $group: {
+          _id: '$employeeId',
+          totalGold: { $sum: '$gold' },
+          count: { $sum: 1 }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          employeeId: '$_id',
+          totalGold: 1,
+          count: 1,
+          earnings: { $divide: ['$totalGold', 1000] },
+          avgGold: { $divide: ['$totalGold', '$count'] }
+        }
+      },
+      { $sort: { earnings: -1 } },
+      { $limit: 10 }
+    ]);
+
+    const ranking = aggregation.map(stat => ({
+      employeeId: stat.employeeId,
+      earnings: parseFloat(stat.earnings.toFixed(3)),
+      count: stat.count,
+      avgGold: parseFloat(stat.avgGold.toFixed(2))
+    }));
+
+    const result = {
+      success: true,
+      data: { 
+        ranking,
+        date: dateStr
+      }
+    };
+
+    // 缓存24小时
+    cache.set(cacheKey, {
+      data: result,
+      expiry: Date.now() + 24 * 60 * 60 * 1000
+    });
+
+    res.json(result);
+  } catch (error) {
+    console.error('获取昨日收益排行错误:', error);
     res.status(500).json({ success: false, message: '服务器错误' });
   }
 });

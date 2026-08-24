@@ -7,6 +7,7 @@ const GoldLog = require('../models/GoldLog');
 const CommissionHistory = require('../models/CommissionHistory');
 const { generateToken, hashPassword, comparePassword } = require('../utils/auth');
 const authMiddleware = require('../middleware/auth');
+const { get: getCache, set: setCache } = require('../utils/cache');
 
 // 初始化默认管理员账号
 const initDefaultAdmin = async () => {
@@ -15,11 +16,11 @@ const initDefaultAdmin = async () => {
     if (count === 0) {
       const defaultAdmin = new Admin({
         username: 'admin',
-        password: hashPassword('admin123'),
+        password: hashPassword('admin123456'),
         role: 'superadmin'
       });
       await defaultAdmin.save();
-      console.log('默认管理员账号创建成功: admin/admin123');
+      console.log('默认管理员账号创建成功: admin/admin123456');
     }
   } catch (error) {
     console.error('初始化默认管理员失败:', error);
@@ -138,10 +139,10 @@ router.get('/group-leader-commission/:teamGroupId', authMiddleware, async (req, 
     let totalCommission = 0;
     const records = [];
     
-    // 获取指定时间范围内的所有金币记录
+    // 获取指定时间范围内的所有金币记录（限制最大返回10000条，避免内存溢出）
     const allGoldLogs = await GoldLog.find({
       createTime: { $gte: startTime, $lt: endTime }
-    });
+    }).limit(10000);
     
     // 提取所有唯一的员工ID
     const employeeIds = [...new Set(allGoldLogs.map(log => log.employeeId))];
@@ -1047,7 +1048,18 @@ router.post('/lottery/add-to-pool', authMiddleware, async (req, res) => {
 // 设置指定中奖用户
 router.post('/lottery/set-winners', authMiddleware, async (req, res) => {
   try {
-    let { issueNumber, firstPrizeUserId, secondPrizeUserId, thirdPrizeUserId } = req.body;
+    let { issueNumber, firstPrizeUserIds, secondPrizeUserIds, thirdPrizeUserIds } = req.body;
+    
+    // 将单个用户ID转换为数组格式，保持向后兼容
+    if (firstPrizeUserIds && !Array.isArray(firstPrizeUserIds)) {
+      firstPrizeUserIds = [firstPrizeUserIds];
+    }
+    if (secondPrizeUserIds && !Array.isArray(secondPrizeUserIds)) {
+      secondPrizeUserIds = [secondPrizeUserIds];
+    }
+    if (thirdPrizeUserIds && !Array.isArray(thirdPrizeUserIds)) {
+      thirdPrizeUserIds = [thirdPrizeUserIds];
+    }
     
     // 如果没有提供期号，自动查找当前未开奖的期号
     if (!issueNumber) {
@@ -1064,9 +1076,13 @@ router.post('/lottery/set-winners', authMiddleware, async (req, res) => {
       }
     }
     
-    // 检查指定的用户是否存在有效的奖券
-    const checkUserId = async (userId) => {
-      if (userId) {
+    // 检查指定的用户是否存在有效的奖券（支持单个用户ID或数组）
+    const checkUserIds = async (userIds) => {
+      if (!userIds || userIds.length === 0) {
+        return true;
+      }
+      
+      for (const userId of userIds) {
         console.log(`检查用户 ${userId} 是否存在有效的奖券，期号: ${issueNumber}`);
         // 先尝试通过userId查找
         let userTickets = await LotteryTicket.find({
@@ -1086,25 +1102,25 @@ router.post('/lottery/set-winners', authMiddleware, async (req, res) => {
         
         console.log(`用户 ${userId} 的有效奖券数量: ${userTickets.length}`);
         if (userTickets.length === 0) {
-          return false;
+          return { valid: false, userId: userId };
         }
       }
-      return true;
+      return { valid: true };
     };
     
     // 检查所有指定的用户
-    const firstPrizeValid = await checkUserId(firstPrizeUserId);
-    const secondPrizeValid = await checkUserId(secondPrizeUserId);
-    const thirdPrizeValid = await checkUserId(thirdPrizeUserId);
+    const firstPrizeResult = await checkUserIds(firstPrizeUserIds);
+    const secondPrizeResult = await checkUserIds(secondPrizeUserIds);
+    const thirdPrizeResult = await checkUserIds(thirdPrizeUserIds);
     
-    if (!firstPrizeValid) {
-      return res.status(400).json({ success: false, message: '一等奖用户没有有效的奖券' });
+    if (!firstPrizeResult.valid) {
+      return res.status(400).json({ success: false, message: `一等奖用户 ${firstPrizeResult.userId} 没有有效的奖券` });
     }
-    if (!secondPrizeValid) {
-      return res.status(400).json({ success: false, message: '二等奖用户没有有效的奖券' });
+    if (!secondPrizeResult.valid) {
+      return res.status(400).json({ success: false, message: `二等奖用户 ${secondPrizeResult.userId} 没有有效的奖券` });
     }
-    if (!thirdPrizeValid) {
-      return res.status(400).json({ success: false, message: '三等奖用户没有有效的奖券' });
+    if (!thirdPrizeResult.valid) {
+      return res.status(400).json({ success: false, message: `三等奖用户 ${thirdPrizeResult.userId} 没有有效的奖券` });
     }
     
     let selection = await LotteryWinnerSelection.findOne({ issueNumber });
@@ -1112,14 +1128,14 @@ router.post('/lottery/set-winners', authMiddleware, async (req, res) => {
       selection = new LotteryWinnerSelection({ issueNumber });
     }
     
-    if (firstPrizeUserId !== undefined) {
-      selection.firstPrizeUserId = firstPrizeUserId;
+    if (firstPrizeUserIds !== undefined) {
+      selection.firstPrizeUserIds = firstPrizeUserIds;
     }
-    if (secondPrizeUserId !== undefined) {
-      selection.secondPrizeUserId = secondPrizeUserId;
+    if (secondPrizeUserIds !== undefined) {
+      selection.secondPrizeUserIds = secondPrizeUserIds;
     }
-    if (thirdPrizeUserId !== undefined) {
-      selection.thirdPrizeUserId = thirdPrizeUserId;
+    if (thirdPrizeUserIds !== undefined) {
+      selection.thirdPrizeUserIds = thirdPrizeUserIds;
     }
     
     await selection.save();
@@ -1233,109 +1249,119 @@ router.post('/lottery/draw', authMiddleware, async (req, res) => {
       thirdPrize: []
     };
     
-    if (selection && (selection.firstPrizeUserId || selection.secondPrizeUserId || selection.thirdPrizeUserId)) {
+    if (selection && (selection.firstPrizeUserIds && selection.firstPrizeUserIds.length > 0 || 
+          selection.secondPrizeUserIds && selection.secondPrizeUserIds.length > 0 || 
+          selection.thirdPrizeUserIds && selection.thirdPrizeUserIds.length > 0)) {
       drawType = '指定';
       
-      // 处理指定的中奖用户
-      if (selection.firstPrizeUserId) {
-        // 获取用户的有效奖券，先尝试通过userId查找，再尝试通过employeeId查找
-        let firstPrizeUserTickets = await LotteryTicket.find({
-          userId: selection.firstPrizeUserId,
-          issueNumber: issueNumber,
-          status: '有效'
-        });
-        
-        if (firstPrizeUserTickets.length === 0) {
-          firstPrizeUserTickets = await LotteryTicket.find({
-            employeeId: selection.firstPrizeUserId,
+      // 处理指定的一等奖用户（支持多个）
+      if (selection.firstPrizeUserIds && selection.firstPrizeUserIds.length > 0) {
+        for (const userId of selection.firstPrizeUserIds) {
+          // 获取用户的有效奖券，先尝试通过userId查找，再尝试通过employeeId查找
+          let firstPrizeUserTickets = await LotteryTicket.find({
+            userId: userId,
             issueNumber: issueNumber,
             status: '有效'
           });
-        }
-        
-        if (firstPrizeUserTickets.length > 0) {
-          // 随机抽取一张奖券
-          const randomIndex = Math.floor(Math.random() * firstPrizeUserTickets.length);
-          const winningTicket = firstPrizeUserTickets[randomIndex];
           
-          winners.firstPrize.push({
-            userId: winningTicket.userId,
-            employeeId: winningTicket.employeeId,
-            amount: firstPrize,
-            ticketNumber: winningTicket.ticketNumber
-          });
+          if (firstPrizeUserTickets.length === 0) {
+            firstPrizeUserTickets = await LotteryTicket.find({
+              employeeId: userId,
+              issueNumber: issueNumber,
+              status: '有效'
+            });
+          }
           
-          // 更新奖券状态为中奖
-          winningTicket.status = '中奖';
-          await winningTicket.save();
+          if (firstPrizeUserTickets.length > 0) {
+            // 随机抽取一张奖券
+            const randomIndex = Math.floor(Math.random() * firstPrizeUserTickets.length);
+            const winningTicket = firstPrizeUserTickets[randomIndex];
+            
+            winners.firstPrize.push({
+              userId: winningTicket.userId,
+              employeeId: winningTicket.employeeId,
+              amount: firstPrize / selection.firstPrizeUserIds.length,
+              ticketNumber: winningTicket.ticketNumber
+            });
+            
+            // 更新奖券状态为中奖
+            winningTicket.status = '中奖';
+            await winningTicket.save();
+          }
         }
       }
       
-      if (selection.secondPrizeUserId) {
-        // 获取用户的有效奖券，先尝试通过userId查找，再尝试通过employeeId查找
-        let secondPrizeUserTickets = await LotteryTicket.find({
-          userId: selection.secondPrizeUserId,
-          issueNumber: issueNumber,
-          status: '有效'
-        });
-        
-        if (secondPrizeUserTickets.length === 0) {
-          secondPrizeUserTickets = await LotteryTicket.find({
-            employeeId: selection.secondPrizeUserId,
+      // 处理指定的二等奖用户（支持多个）
+      if (selection.secondPrizeUserIds && selection.secondPrizeUserIds.length > 0) {
+        for (const userId of selection.secondPrizeUserIds) {
+          // 获取用户的有效奖券，先尝试通过userId查找，再尝试通过employeeId查找
+          let secondPrizeUserTickets = await LotteryTicket.find({
+            userId: userId,
             issueNumber: issueNumber,
             status: '有效'
           });
-        }
-        
-        if (secondPrizeUserTickets.length > 0) {
-          // 随机抽取一张奖券
-          const randomIndex = Math.floor(Math.random() * secondPrizeUserTickets.length);
-          const winningTicket = secondPrizeUserTickets[randomIndex];
           
-          winners.secondPrize.push({
-            userId: winningTicket.userId,
-            employeeId: winningTicket.employeeId,
-            amount: secondPrize,
-            ticketNumber: winningTicket.ticketNumber
-          });
+          if (secondPrizeUserTickets.length === 0) {
+            secondPrizeUserTickets = await LotteryTicket.find({
+              employeeId: userId,
+              issueNumber: issueNumber,
+              status: '有效'
+            });
+          }
           
-          // 更新奖券状态为中奖
-          winningTicket.status = '中奖';
-          await winningTicket.save();
+          if (secondPrizeUserTickets.length > 0) {
+            // 随机抽取一张奖券
+            const randomIndex = Math.floor(Math.random() * secondPrizeUserTickets.length);
+            const winningTicket = secondPrizeUserTickets[randomIndex];
+            
+            winners.secondPrize.push({
+              userId: winningTicket.userId,
+              employeeId: winningTicket.employeeId,
+              amount: secondPrize / selection.secondPrizeUserIds.length,
+              ticketNumber: winningTicket.ticketNumber
+            });
+            
+            // 更新奖券状态为中奖
+            winningTicket.status = '中奖';
+            await winningTicket.save();
+          }
         }
       }
       
-      if (selection.thirdPrizeUserId) {
-        // 获取用户的有效奖券，先尝试通过userId查找，再尝试通过employeeId查找
-        let thirdPrizeUserTickets = await LotteryTicket.find({
-          userId: selection.thirdPrizeUserId,
-          issueNumber: issueNumber,
-          status: '有效'
-        });
-        
-        if (thirdPrizeUserTickets.length === 0) {
-          thirdPrizeUserTickets = await LotteryTicket.find({
-            employeeId: selection.thirdPrizeUserId,
+      // 处理指定的三等奖用户（支持多个）
+      if (selection.thirdPrizeUserIds && selection.thirdPrizeUserIds.length > 0) {
+        for (const userId of selection.thirdPrizeUserIds) {
+          // 获取用户的有效奖券，先尝试通过userId查找，再尝试通过employeeId查找
+          let thirdPrizeUserTickets = await LotteryTicket.find({
+            userId: userId,
             issueNumber: issueNumber,
             status: '有效'
           });
-        }
-        
-        if (thirdPrizeUserTickets.length > 0) {
-          // 随机抽取一张奖券
-          const randomIndex = Math.floor(Math.random() * thirdPrizeUserTickets.length);
-          const winningTicket = thirdPrizeUserTickets[randomIndex];
           
-          winners.thirdPrize.push({
-            userId: winningTicket.userId,
-            employeeId: winningTicket.employeeId,
-            amount: thirdPrize,
-            ticketNumber: winningTicket.ticketNumber
-          });
+          if (thirdPrizeUserTickets.length === 0) {
+            thirdPrizeUserTickets = await LotteryTicket.find({
+              employeeId: userId,
+              issueNumber: issueNumber,
+              status: '有效'
+            });
+          }
           
-          // 更新奖券状态为中奖
-          winningTicket.status = '中奖';
-          await winningTicket.save();
+          if (thirdPrizeUserTickets.length > 0) {
+            // 随机抽取一张奖券
+            const randomIndex = Math.floor(Math.random() * thirdPrizeUserTickets.length);
+            const winningTicket = thirdPrizeUserTickets[randomIndex];
+            
+            winners.thirdPrize.push({
+              userId: winningTicket.userId,
+              employeeId: winningTicket.employeeId,
+              amount: thirdPrize / selection.thirdPrizeUserIds.length,
+              ticketNumber: winningTicket.ticketNumber
+            });
+            
+            // 更新奖券状态为中奖
+            winningTicket.status = '中奖';
+            await winningTicket.save();
+          }
         }
       }
     } else {
@@ -1427,12 +1453,16 @@ router.post('/lottery/draw', authMiddleware, async (req, res) => {
         userGold = new UserGold({ 
           userId: winner.userId, 
           employeeId: winner.employeeId, 
-          currentMonthGold: 0, 
+          currentMonthGold: winner.amount, 
           lastMonthGold: 0 
         });
+        await userGold.save();
+      } else {
+        await UserGold.updateOne(
+          { userId: winner.userId },
+          { $inc: { currentMonthGold: winner.amount } }
+        );
       }
-      userGold.currentMonthGold += winner.amount;
-      await userGold.save();
       
       // 记录金币日志
       const goldLog = new GoldLog({
@@ -1455,12 +1485,16 @@ router.post('/lottery/draw', authMiddleware, async (req, res) => {
         userGold = new UserGold({ 
           userId: winner.userId, 
           employeeId: winner.employeeId, 
-          currentMonthGold: 0, 
+          currentMonthGold: winner.amount, 
           lastMonthGold: 0 
         });
+        await userGold.save();
+      } else {
+        await UserGold.updateOne(
+          { userId: winner.userId },
+          { $inc: { currentMonthGold: winner.amount } }
+        );
       }
-      userGold.currentMonthGold += winner.amount;
-      await userGold.save();
       
       // 记录金币日志
       const goldLog = new GoldLog({
@@ -1483,12 +1517,16 @@ router.post('/lottery/draw', authMiddleware, async (req, res) => {
         userGold = new UserGold({ 
           userId: winner.userId, 
           employeeId: winner.employeeId, 
-          currentMonthGold: 0, 
+          currentMonthGold: winner.amount, 
           lastMonthGold: 0 
         });
+        await userGold.save();
+      } else {
+        await UserGold.updateOne(
+          { userId: winner.userId },
+          { $inc: { currentMonthGold: winner.amount } }
+        );
       }
-      userGold.currentMonthGold += winner.amount;
-      await userGold.save();
       
       // 记录金币日志
       const goldLog = new GoldLog({
@@ -1805,4 +1843,213 @@ router.put('/account/:id', authMiddleware, async (req, res) => {
   }
 });
 
-module.exports = router;
+router.get('/ecpm-records', authMiddleware, async (req, res) => {
+  try {
+    const role = req.user?.role;
+    const isSuper = role === 'superadmin' || String(role).toUpperCase() === 'SUPER_ADMIN';
+    if (!isSuper) {
+      return res.status(403).json({ success: false, message: '无权限访问' });
+    }
+
+    const { date } = req.query;
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ success: false, message: '日期参数格式错误，应为 YYYY-MM-DD' });
+    }
+
+    const cacheKey = `admin:ecpm-records:${date}`;
+    const cachedData = getCache(cacheKey);
+    
+    const todayStr = new Date(new Date().getTime() + 8 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const isToday = date === todayStr;
+    if (cachedData) {
+      let filteredData = cachedData;
+      if (isToday) {
+        const now = new Date();
+        const beijingTime = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+        const beijingHour = beijingTime.getHours();
+        const beijingMinute = beijingTime.getMinutes();
+        const currentBucketMinute = Math.floor(beijingMinute / 10) * 10;
+        
+        filteredData = cachedData.filter(record => {
+          const [h, m] = record.startTime.split(':').map(Number);
+          return !(h > beijingHour || (h === beijingHour && m >= currentBucketMinute));
+        });
+      }
+      
+      return res.json({
+        success: true,
+        data: {
+          records: filteredData
+        }
+      });
+    }
+
+    const startUTC = new Date(date + 'T00:00:00+08:00');
+    const endUTC = new Date(date + 'T24:00:00+08:00');
+
+    const cacheTTL = isToday ? 5 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
+
+    const records = await GoldLog.aggregate([
+      { $match: { createTime: { $gte: startUTC, $lt: endUTC } } },
+      {
+        $group: {
+          _id: {
+            hour: { $hour: { date: '$createTime', timezone: '+08:00' } },
+            minute: { $subtract: [{ $minute: { date: '$createTime', timezone: '+08:00' } }, { $mod: [{ $minute: { date: '$createTime', timezone: '+08:00' } }, 10] }] }
+          },
+          totalEcpm: { $sum: '$ecpm' },
+          count: { $sum: 1 }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          hour: '$_id.hour',
+          minute: '$_id.minute',
+          averageECPM: { $divide: ['$totalEcpm', '$count'] },
+          count: 1
+        }
+      },
+      { $sort: { hour: 1, minute: 1 } }
+    ]).exec();
+
+    const resultRecords = [];
+    const recordMap = new Map();
+
+    for (const r of records) {
+      const key = `${r.hour}:${r.minute}`;
+      recordMap.set(key, {
+        averageECPM: parseFloat(r.averageECPM.toFixed(2)),
+        count: r.count
+      });
+    }
+
+    const now = new Date();
+    const beijingTime = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+    const beijingHour = beijingTime.getHours();
+    const beijingMinute = beijingTime.getMinutes();
+
+    for (let h = 0; h < 24; h++) {
+      for (let m = 0; m < 60; m += 10) {
+        if (isToday) {
+          const currentBucketHour = beijingHour;
+          const currentBucketMinute = Math.floor(beijingMinute / 10) * 10;
+          if (h > currentBucketHour || (h === currentBucketHour && m >= currentBucketMinute)) {
+            continue;
+          }
+        }
+
+        const key = `${h}:${m}`;
+        const data = recordMap.get(key);
+        const avgEcpm = data ? data.averageECPM : 0;
+        const count = data ? data.count : 0;
+        const startTime = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+        const endMinute = (m + 10) % 60;
+        const endHour = endMinute === 0 ? (h + 1) % 24 : h;
+        const endTime = `${String(endHour).padStart(2, '0')}:${String(endMinute).padStart(2, '0')}`;
+
+        resultRecords.push({
+          id: `${h * 6 + (m / 10)}`,
+          startTime,
+          endTime,
+          averageECPM: avgEcpm,
+          count: count
+        });
+      }
+    }
+
+    setCache(cacheKey, resultRecords, cacheTTL);
+
+    res.json({
+      success: true,
+      data: {
+        records: resultRecords
+      }
+    });
+  } catch (error) {
+    console.error('获取ECPM记录错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+async function _prewarmEcpmCache() {
+  try {
+    const GoldLog = require('../models/GoldLog');
+    const { set: setCache } = require('../utils/cache');
+    
+    const today = new Date(new Date().getTime() + 8 * 60 * 60 * 1000);
+    for (let i = 1; i < 8; i++) {
+      const date = new Date(today);
+      date.setDate(date.getDate() - i);
+      const dateStr = date.toISOString().split('T')[0];
+      
+      const startUTC = new Date(dateStr + 'T00:00:00+08:00');
+      const endUTC = new Date(dateStr + 'T24:00:00+08:00');
+      const cacheKey = `admin:ecpm-records:${dateStr}`;
+      const cacheTTL = 7 * 24 * 60 * 60 * 1000;
+      
+      const records = await GoldLog.aggregate([
+        { $match: { createTime: { $gte: startUTC, $lt: endUTC }, ecpm: { $gt: 0 } } },
+        {
+          $group: {
+            _id: {
+              hour: { $hour: { date: '$createTime', timezone: '+08:00' } },
+              minute: { $subtract: [{ $minute: { date: '$createTime', timezone: '+08:00' } }, { $mod: [{ $minute: { date: '$createTime', timezone: '+08:00' } }, 10] }] }
+            },
+            totalEcpm: { $sum: '$ecpm' },
+            count: { $sum: 1 }
+          }
+        },
+        {
+          $project: {
+            _id: 0,
+            hour: '$_id.hour',
+            minute: '$_id.minute',
+            averageECPM: { $divide: ['$totalEcpm', '$count'] },
+            count: 1
+          }
+        },
+        { $sort: { hour: 1, minute: 1 } }
+      ]).exec();
+      
+      const resultRecords = [];
+      const recordMap = new Map();
+      
+      for (const r of records) {
+        const key = `${r.hour}:${r.minute}`;
+        recordMap.set(key, {
+          averageECPM: parseFloat(r.averageECPM.toFixed(2)),
+          count: r.count
+        });
+      }
+      
+      for (let h = 0; h < 24; h++) {
+        for (let m = 0; m < 60; m += 10) {
+          const key = `${h}:${m}`;
+          const data = recordMap.get(key);
+          const avgEcpm = data ? data.averageECPM : 0;
+          const count = data ? data.count : 0;
+          const startTime = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+          const endMinute = (m + 10) % 60;
+          const endHour = endMinute === 0 ? (h + 1) % 24 : h;
+          const endTime = `${String(endHour).padStart(2, '0')}:${String(endMinute).padStart(2, '0')}`;
+          
+          resultRecords.push({
+            id: `${h * 6 + (m / 10)}`,
+            startTime,
+            endTime,
+            averageECPM: avgEcpm,
+            count: count
+          });
+        }
+      }
+      
+      setCache(cacheKey, resultRecords, cacheTTL);
+      console.log(`[ECPM预热] ${dateStr} 已缓存 (${resultRecords.length}条)`);
+    }
+  } catch (error) {
+    console.error('[ECPM预热] 失败:', error.message);
+  }
+}
+
+module.exports = { router, _prewarmEcpmCache };

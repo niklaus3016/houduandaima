@@ -43,6 +43,18 @@ const employeeSchema = new mongoose.Schema({
     type: String,
     default: 'EMPLOYEE'
   },
+  csjDeviceLimit: {
+    type: Number,
+    default: 2
+  },
+  ksDeviceLimit: {
+    type: Number,
+    default: 2
+  },
+  ylhDeviceLimit: {
+    type: Number,
+    default: 2
+  },
   joinedGroupAt: {
     type: Date,
     default: Date.now

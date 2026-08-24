@@ -4,26 +4,7 @@ const UserGold = require('../models/UserGold');
 const DailyTarget = require('../models/DailyTarget');
 const DailyBonusClaim = require('../models/DailyBonusClaim');
 const GoldLog = require('../models/GoldLog');
-
-// 获取北京时间
-function getBeijingDate() {
-  const now = new Date();
-  return new Date(now.getTime() + 8 * 60 * 60 * 1000);
-}
-
-// 获取北京时间的当天开始（返回UTC时间）
-// 参数date已经是北京时间（通过getBeijingDate获取）
-function getBeijingStartOfDay(beijingTime) {
-  // 获取北京时间的年月日
-  const year = beijingTime.getUTCFullYear();
-  const month = beijingTime.getUTCMonth();
-  const day = beijingTime.getUTCDate();
-  // 创建北京时间当天00:00:00对应的UTC时间
-  // 先创建该日期的UTC时间00:00:00，然后减去8小时得到北京时间00:00:00对应的UTC时间
-  const utcMidnight = new Date(Date.UTC(year, month, day, 0, 0, 0));
-  const beijingStartUTC = new Date(utcMidnight.getTime() - 8 * 60 * 60 * 1000);
-  return beijingStartUTC;
-}
+const { getBeijingDate, getBeijingStartOfDay, getBeijingDateString } = require('../utils/date');
 
 // 领取额外金币
 router.post('/claim', async (req, res) => {

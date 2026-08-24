@@ -4,6 +4,7 @@ const GoldLog = require('../models/GoldLog');
 const UserGold = require('../models/UserGold');
 const Employee = require('../models/Employee');
 const authMiddleware = require('../middleware/auth');
+const mongoose = require('mongoose');
 
 // 获取北京时间
 function getBeijingDate(date = new Date()) {
@@ -26,23 +27,105 @@ function formatMonthDay(date) {
   return `${month}-${day}`;
 }
 
+/**
+ * ================================================================
+ * 🌿 方案A：解析 4 种目标 ID 形式，返回 { employeeId (用于聚合的主键), returnUserId (返回给前端展示的ID) }
+ *  识别优先级（性能从高到低依次尝试，命中即停）：
+ *   ① "emp_1065"        → dashboard/users 返回的 userId，剥离 emp_ 取 employeeId
+ *   ② 纯数字 2~6 位 "1065" → Employee.employeeId（数字工号字符串）
+ *   ③ 24位 Mongo ObjectId / 合法 ObjectId 形式
+ *                        → 去 Employee 表按 _id 找
+ *   ④ UserGold.userId   → 原逻辑（App 端普通用户，兼容老数据）
+ *  返回: { matchOk: bool, matchBy: string, goldLogMatchStage: object, returnUserId: string, empName: string }
+ * ================================================================
+ */
+async function resolveTargetId(paramId) {
+  const raw = String(paramId || '').trim();
+  if (!raw) return { matchOk: false, matchBy: 'empty' };
+
+  // ---------- ① emp_ 前缀形式（dashboard/users 返回的 userId = `emp_${employeeId}`）----------
+  const empMatch = raw.match(/^emp_(.+)$/i);
+  if (empMatch) {
+    const maybeEmpId = empMatch[1];
+    const emp = await Employee.findOne({ employeeId: maybeEmpId }).select('_id employeeId realName').lean();
+    if (emp) {
+      return {
+        matchOk: true,
+        matchBy: 'emp_prefix',
+        goldLogMatchStage: { employeeId: emp.employeeId },
+        returnUserId: emp.employeeId,
+        empName: emp.realName || ''
+      };
+    }
+  }
+
+  // ---------- ② 纯数字 2~6 位 → 当 employeeId（数字工号字符串）----------
+  if (/^\d{2,6}$/.test(raw)) {
+    const emp = await Employee.findOne({ employeeId: raw }).select('_id employeeId realName').lean();
+    if (emp) {
+      return {
+        matchOk: true,
+        matchBy: 'employeeId_digits',
+        goldLogMatchStage: { employeeId: emp.employeeId },
+        returnUserId: emp.employeeId,
+        empName: emp.realName || ''
+      };
+    }
+  }
+
+  // ---------- ③ 合法 ObjectId → 先去 Employee._id 找，找不到再去尝试 UserGold ----------
+  if (mongoose.Types.ObjectId.isValid(raw)) {
+    // 3a. Employee._id
+    try {
+      const emp = await Employee.findById(raw).select('_id employeeId realName').lean();
+      if (emp && emp.employeeId) {
+        return {
+          matchOk: true,
+          matchBy: 'employeeObjectId',
+          goldLogMatchStage: { employeeId: emp.employeeId },
+          returnUserId: emp.employeeId,
+          empName: emp.realName || ''
+        };
+      }
+    } catch (_) { /* ignore */ }
+  }
+
+  // ---------- ④ 原逻辑：UserGold.userId（App端普通用户）----------
+  const userGold = await UserGold.findOne({ userId: raw });
+  if (userGold && userGold.employeeId) {
+    return {
+      matchOk: true,
+      matchBy: 'userGold_userId',
+      goldLogMatchStage: { employeeId: userGold.employeeId }, // 🌿 统一按 employeeId 聚合 GoldLog（强一致），不再按 userId
+      returnUserId: userGold.employeeId,
+      empName: ''
+    };
+  }
+
+  return { matchOk: false, matchBy: 'none' };
+}
+
 // 获取用户收益详情
 router.get('/:userId/earnings', authMiddleware, async (req, res) => {
   try {
-    const { userId } = req.params;
-    
-    // 查找用户
-    const userGold = await UserGold.findOne({ userId });
-    if (!userGold) {
-      return res.status(404).json({ success: false, message: '用户不存在' });
+    const { userId: rawUserId } = req.params;
+
+    // ================================================================
+    // 🌿 方案A：先解析目标ID（支持 emp_ / 数字工号 / ObjectId / UserGold.userId 四种）
+    // ================================================================
+    const target = await resolveTargetId(rawUserId);
+    if (!target.matchOk) {
+      return res.status(404).json({
+        success: false,
+        message: `用户不存在（无法识别ID: ${rawUserId}，支持: emp_工号、数字工号、Employee._id、UserGold.userId）`
+      });
     }
-    
-    const employeeId = userGold.employeeId;
-    
-    // 用聚合查询一次性统计，避免拉取所有记录
+    const { goldLogMatchStage, returnUserId } = target;
+
+    // 用聚合查询一次性统计，按 employeeId 聚合 match（上面 resolve 时已填好 employeeId）
     const aggregateResults = await GoldLog.aggregate([
       {
-        $match: { userId }
+        $match: goldLogMatchStage
       },
       {
         $project: {
@@ -72,13 +155,13 @@ router.get('/:userId/earnings', authMiddleware, async (req, res) => {
           '_id.day': 1
         }
       }
-    ]);
-    
+    ]).allowDiskUse(true);
+
     if (aggregateResults.length === 0) {
       return res.json({
         success: true,
         data: {
-          userId: employeeId,
+          userId: returnUserId,
           totalEarnings: 0,
           currentMonth: {
             month: formatYearMonth(new Date()),
@@ -86,21 +169,22 @@ router.get('/:userId/earnings', authMiddleware, async (req, res) => {
             days: []
           },
           historyMonths: []
-        }
+        },
+        _debug: { matchBy: target.matchBy, matched: goldLogMatchStage }
       });
     }
-    
+
     // 整理聚合结果
     const monthlyData = {};
     let totalGold = 0;
-    
+
     aggregateResults.forEach(result => {
       const { year, month, day } = result._id;
       const monthKey = `${year}-${String(month).padStart(2, '0')}`;
       const dayKey = `${monthKey}-${String(day).padStart(2, '0')}`;
-      
+
       totalGold += result.totalGold;
-      
+
       if (!monthlyData[monthKey]) {
         monthlyData[monthKey] = {
           year,
@@ -108,30 +192,30 @@ router.get('/:userId/earnings', authMiddleware, async (req, res) => {
           days: {}
         };
       }
-      
+
       monthlyData[monthKey].days[dayKey] = {
         date: dayKey,
         earnings: result.totalGold / 1000,
         watched: result.watched
       };
     });
-    
+
     const totalEarnings = parseFloat((totalGold / 1000).toFixed(2));
-    
+
     // 获取当前月份
     const now = new Date();
     const beijingNow = getBeijingDate(now);
     const currentYear = beijingNow.getUTCFullYear();
     const currentMonth = beijingNow.getUTCMonth() + 1;
     const currentMonthKey = `${currentYear}-${String(currentMonth).padStart(2, '0')}`;
-    
+
     // 构建当前月份数据
     let currentMonthData = {
       month: formatYearMonth(now),
       totalEarnings: 0,
       days: []
     };
-    
+
     if (monthlyData[currentMonthKey]) {
       const monthInfo = monthlyData[currentMonthKey];
       const days = Object.values(monthInfo.days).map(day => ({
@@ -139,14 +223,14 @@ router.get('/:userId/earnings', authMiddleware, async (req, res) => {
         earnings: parseFloat(day.earnings.toFixed(2)),
         watched: day.watched
       }));
-      
+
       // 按日期倒序排列
       days.sort((a, b) => {
         const dateA = new Date(`2026-${a.date}`);
         const dateB = new Date(`2026-${b.date}`);
         return dateB - dateA;
       });
-      
+
       // 计算累计收益
       let cumulative = 0;
       // 先计算之前月份的总收益
@@ -157,24 +241,24 @@ router.get('/:userId/earnings', authMiddleware, async (req, res) => {
           });
         }
       });
-      
+
       // 再按日期正序计算累计
       const sortedDays = [...days].reverse();
       sortedDays.forEach(day => {
         cumulative += day.earnings;
         day.cumulative = parseFloat(cumulative.toFixed(2));
       });
-      
+
       // 再倒序回来
       sortedDays.reverse();
-      
+
       currentMonthData = {
         month: formatYearMonth(now),
         totalEarnings: parseFloat(days.reduce((sum, d) => sum + d.earnings, 0).toFixed(2)),
         days: sortedDays
       };
     }
-    
+
     // 构建历史月份数据（过去6个月，不含当前月）
     const historyMonths = [];
     const sortedMonthKeys = Object.keys(monthlyData)
@@ -182,26 +266,27 @@ router.get('/:userId/earnings', authMiddleware, async (req, res) => {
       .sort()
       .reverse()
       .slice(0, 6);
-    
+
     sortedMonthKeys.forEach(key => {
       const monthInfo = monthlyData[key];
       const monthTotal = Object.values(monthInfo.days)
         .reduce((sum, day) => sum + day.earnings, 0);
-      
+
       historyMonths.push({
         month: `${monthInfo.year}年${String(monthInfo.month).padStart(2, '0')}月`,
         totalEarnings: parseFloat(monthTotal.toFixed(2))
       });
     });
-    
+
     res.json({
       success: true,
       data: {
-        userId: employeeId,
+        userId: returnUserId,
         totalEarnings,
         currentMonth: currentMonthData,
         historyMonths
-      }
+      },
+      _debug: { matchBy: target.matchBy, matched: goldLogMatchStage }
     });
   } catch (error) {
     console.error('获取用户收益详情错误:', error);

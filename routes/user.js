@@ -10,6 +10,7 @@ const Admin = require('../models/Admin');
 const WeeklyTarget = require('../models/WeeklyTarget');
 const WeeklyBonusClaim = require('../models/WeeklyBonusClaim');
 const authMiddleware = require('../middleware/auth');
+const { getBeijingDate, getBeijingStartOfDay, getBeijingEndOfDay, getBeijingDateString } = require('../utils/date');
 
 // 简单内存缓存
 const cache = new Map();
@@ -74,33 +75,6 @@ function getWeekRange(week) {
   };
 }
 
-// 获取北京时间
-function getBeijingDate() {
-  const now = new Date();
-  return new Date(now.getTime() + 8 * 60 * 60 * 1000);
-}
-
-// 获取北京时间的当天开始（返回UTC时间）
-function getBeijingStartOfDay() {
-  const beijingNow = getBeijingDate();
-  const startOfDay = new Date(beijingNow);
-  startOfDay.setHours(0, 0, 0, 0);
-  return new Date(startOfDay.getTime() - 8 * 60 * 60 * 1000);
-}
-
-// 获取北京时间的当天结束（返回北京时间23:59:59）
-function getBeijingEndOfDay() {
-  const beijingNow = getBeijingDate();
-  const endOfDay = new Date(beijingNow);
-  endOfDay.setHours(23, 59, 59, 999);
-  return endOfDay;
-}
-
-// 获取北京时间的当天日期字符串（YYYY-MM-DD）
-function getBeijingDateString() {
-  return getBeijingDate().toISOString().split('T')[0];
-}
-
 // 获取金币信息
 router.get('/info', async (req, res) => {
   try {
@@ -114,7 +88,7 @@ router.get('/info', async (req, res) => {
     
     // 并行查询，提高性能
     let [userGold, weeklyTarget, hasClaimedBonus, currentCount] = await Promise.all([
-      // 1. 查询用户金币
+      // 1. 查询用户金币（必须实时）
       (async () => {
         let gold = await UserGold.findOne({ userId });
         if (!gold) {
@@ -129,7 +103,7 @@ router.get('/info', async (req, res) => {
         return gold;
       })(),
       
-      // 2. 查询本周目标（先查缓存）
+      // 2. 查询本周目标（可以缓存，一周才变一次）
       (async () => {
         const cacheKey = `weeklyTarget_${currentWeek}`;
         let target = getCache(cacheKey);
@@ -140,13 +114,13 @@ router.get('/info', async (req, res) => {
         return target;
       })(),
       
-      // 3. 检查是否已领取奖励
+      // 3. 检查是否已领取奖励（必须实时，防止重复领取）
       WeeklyBonusClaim.exists({
         employeeId: employeeId,
         week: currentWeek
       }),
       
-      // 4. 计算本周收益条数（延迟查询，先判断是否需要）
+      // 4. 计算本周收益条数（必须实时）
       0
     ]);
     

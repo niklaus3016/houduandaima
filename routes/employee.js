@@ -2,7 +2,9 @@ const express = require('express');
 const router = express.Router();
 const Employee = require('../models/Employee');
 const UserGold = require('../models/UserGold');
+const UserActivity = require('../models/UserActivity');
 const { generateToken } = require('../utils/auth');
+const { getBeijingStartOfDay } = require('../utils/date');
 
 // 生成4位随机员工号
 function generateEmployeeId() {
@@ -12,7 +14,7 @@ function generateEmployeeId() {
 // 校验员工号登录
 router.post('/check', async (req, res) => {
   try {
-    const { employeeId } = req.body;
+    const { employeeId, deviceId, packageName } = req.body;
     
     if (!employeeId || employeeId.length !== 4) {
       return res.status(400).json({ success: false, message: '请输入4位员工号' });
@@ -25,6 +27,97 @@ router.post('/check', async (req, res) => {
     
     if (!employee) {
       return res.status(401).json({ success: false, message: '员工号不存在或已禁用' });
+    }
+    
+    // 设备数校验（CSJ/快手/优量汇系统，按系统+包名独立统计，百度系统不校验）
+    // 默认 limit=0 表示不允许登录该系统，需超管在后台开启
+    const DEVICE_SYSTEMS = {
+      'csj_': { platform: 'csj', limitField: 'csjDeviceLimit', name: 'CSJ' },
+      'ks_':  { platform: 'ks',  limitField: 'ksDeviceLimit',  name: '快手' },
+      'ylh_': { platform: 'ylh', limitField: 'ylhDeviceLimit', name: '优量汇' }
+    };
+
+    let matchedSystem = null;
+    let realDeviceId = deviceId;
+    if (deviceId) {
+      for (const [prefix, config] of Object.entries(DEVICE_SYSTEMS)) {
+        if (deviceId.startsWith(prefix)) {
+          matchedSystem = config;
+          realDeviceId = deviceId.slice(prefix.length);
+          break;
+        }
+      }
+    }
+
+    if (matchedSystem) {
+      const { platform, limitField, name } = matchedSystem;
+      // 应用标识：由前端传入包名，未传则默认 'default'（兼容旧版本）
+      const appId = packageName || 'default';
+      // 兜底：如果 ks/ylh 对应字段未设置（<=0），统一使用 csjDeviceLimit 的值
+      // 确保超管只在前端填 csjDeviceLimit 一个值时三系统同步生效
+      let deviceLimit = employee[limitField] || 0;
+      if (deviceLimit <= 0 && (limitField === 'ksDeviceLimit' || limitField === 'ylhDeviceLimit')) {
+        deviceLimit = employee.csjDeviceLimit || 0;
+      }
+
+      // 0 表示未授权登录该系统
+      if (deviceLimit <= 0) {
+        return res.status(403).json({
+          success: false,
+          message: `您暂无${name}系统登录权限，请联系管理员开通`,
+          code: 'LOGIN_NOT_AUTHORIZED'
+        });
+      }
+
+      // 统计当天北京时间的该系统唯一设备数（按应用独立）
+      const startOfToday = getBeijingStartOfDay();
+      const endOfToday = new Date(startOfToday.getTime() + 24 * 60 * 60 * 1000);
+
+      // 先检查当前设备+应用是否已登录过（同一设备+同一应用可重复登录）
+      const existingDevice = await UserActivity.findOne({
+        employeeId,
+        deviceId: realDeviceId,
+        platform,
+        csjAppId: appId,
+        createTime: { $gte: startOfToday, $lt: endOfToday }
+      });
+
+      if (!existingDevice) {
+        // 当前设备+当前应用 未登录过，统计今日该应用的唯一设备数
+        const deviceCountResult = await UserActivity.aggregate([
+          {
+            $match: {
+              employeeId,
+              platform,
+              csjAppId: appId,
+              createTime: { $gte: startOfToday, $lt: endOfToday }
+            }
+          },
+          { $group: { _id: '$deviceId' } },
+          { $count: 'total' }
+        ]);
+
+        const todayDeviceCount = deviceCountResult[0]?.total || 0;
+
+        if (todayDeviceCount >= deviceLimit) {
+          return res.status(403).json({
+            success: false,
+            message: `今日设备数已达上限（${deviceLimit}台），请明天再来或联系管理员`,
+            code: 'DEVICE_LIMIT_EXCEEDED'
+          });
+        }
+
+        // 记录新设备登录
+        await UserActivity.create({
+          userId: employee._id.toString(),
+          employeeId,
+          ip: req.ip || 'unknown',
+          deviceId: realDeviceId,
+          platform,
+          csjAppId: appId,
+          createTime: new Date()
+        });
+      }
     }
     
     // 查找该员工的用户金币记录，获取userId
@@ -141,24 +234,59 @@ router.post('/reward-gold', async (req, res) => {
       return res.status(400).json({ success: false, message: '缺少必要参数' });
     }
     
-    // 获取分成比例（默认50%）
-    let commissionRate = 0.5;
-    try {
-      const SystemConfig = require('../models/SystemConfig');
-      const config = await SystemConfig.findOne({ key: 'commissionRate' });
-      if (config) {
-        commissionRate = config.value;
+    let platform = '';
+    // 优先根据 deviceId 前缀识别系统
+    if (deviceId && deviceId.startsWith('csj_')) {
+      platform = 'csj';
+    } else if (deviceId && deviceId.startsWith('ks_')) {
+      platform = 'ks';
+    } else if (deviceId && deviceId.startsWith('ylh_')) {
+      platform = 'ylh';
+    } else if (slotId && /^10\d{6,10}$/.test(slotId)) {
+      // 兼容旧逻辑：slotId 以 10 开头（8-12位）识别为 csj
+      platform = 'csj';
+    }
+    
+    // 穿山甲（csj）固定分成比例 40%（硬编码，不走 SystemConfig.commissionRate）
+    // 其他平台（百度/快手/优量汇等）仍按 SystemConfig.commissionRate，默认兜底 50%
+    // 若后续需要调整穿山甲分成比例，改此处常量 CSJ_FIXED_COMMISSION_RATE 即可
+    const CSJ_FIXED_COMMISSION_RATE = 0.4;
+    let commissionRate;
+    if (platform === 'csj') {
+      commissionRate = CSJ_FIXED_COMMISSION_RATE;
+    } else {
+      commissionRate = 0.5;
+      try {
+        const SystemConfig = require('../models/SystemConfig');
+        const config = await SystemConfig.findOne({ key: 'commissionRate' });
+        if (config) {
+          commissionRate = config.value;
+        }
+      } catch (err) {
+        console.error('查询系统配置错误:', err);
+        // 即使查询失败，也使用默认值
       }
-    } catch (err) {
-      console.error('查询系统配置错误:', err);
-      // 即使查询失败，也使用默认值
     }
     
     // 计算金币（ECPM * 分成比例）
     const gold = ecpm * commissionRate;
     
+    // 获取彩票设置
+    let settings = null;
+    try {
+      const LotterySettings = require('../models/LotterySettings');
+      settings = await LotterySettings.findOne();
+      if (!settings) {
+        settings = new LotterySettings();
+        await settings.save();
+      }
+    } catch (err) {
+      console.error('获取彩票设置错误:', err);
+    }
+    
     // 更新用户金币和广告次数
     let userGold = await UserGold.findOne({ userId });
+    let shouldGenerateTicket = false;
     
     if (!userGold) {
       // 如果用户不存在，创建新记录
@@ -169,28 +297,38 @@ router.post('/reward-gold', async (req, res) => {
         lastMonthGold: 0,
         adCount: 1
       });
+      shouldGenerateTicket = settings && 1 >= settings.adCountThreshold;
     } else {
-      // 更新当月金币和广告次数
-      userGold.currentMonthGold += gold;
-      userGold.adCount += 1;
+      const newAdCount = userGold.adCount + 1;
+      shouldGenerateTicket = settings && newAdCount >= settings.adCountThreshold;
+      
+      if (shouldGenerateTicket) {
+        await UserGold.updateOne(
+          { userId },
+          { $inc: { currentMonthGold: gold }, $set: { adCount: 0 } }
+        );
+        userGold.currentMonthGold += gold;
+        userGold.adCount = 0;
+      } else {
+        await UserGold.updateOne(
+          { userId },
+          { $inc: { currentMonthGold: gold, adCount: 1 } }
+        );
+        userGold.currentMonthGold += gold;
+        userGold.adCount = newAdCount;
+      }
     }
     
     // 检查是否达到广告次数阈值，生成奖券
     let ticketNumber = null;
     let issueNumber = null;
     try {
-      const LotterySettings = require('../models/LotterySettings');
       const LotteryTicket = require('../models/LotteryTicket');
       
-      // 获取彩票设置
-      let settings = await LotterySettings.findOne();
-      if (!settings) {
-        settings = new LotterySettings();
-        await settings.save();
-      }
+      // 获取彩票设置（已经获取过了
       
       // 检查是否达到广告次数阈值
-      if (userGold.adCount >= settings.adCountThreshold) {
+      if (shouldGenerateTicket) {
         // 生成期号
         const LotteryHistory = require('../models/LotteryHistory');
         const latestHistory = await LotteryHistory.findOne(
@@ -232,16 +370,15 @@ router.post('/reward-gold', async (req, res) => {
         });
         
         await ticket.save();
-        
-        // 重置广告次数
-        userGold.adCount = 0;
       }
     } catch (err) {
       console.error('生成奖券错误:', err);
       // 即使生成奖券失败，也继续发放金币
     }
     
-    await userGold.save();
+    if (!userGold._id || userGold.isNew) {
+      await userGold.save();
+    }
     
     // 记录金币日志
     const GoldLog = require('../models/GoldLog');
@@ -270,6 +407,7 @@ router.post('/reward-gold', async (req, res) => {
       ecpm,
       gold,
       slotId: slotId || '',
+      platform: platform || '',
       commissionRate: groupCommissionRate,
       createTime: new Date()
     });
@@ -291,7 +429,7 @@ router.post('/reward-gold', async (req, res) => {
     
     // 计算并添加到奖金池
     const LotterySettings = require('../models/LotterySettings');
-    let settings = await LotterySettings.findOne();
+    settings = await LotterySettings.findOne();
     if (!settings) {
       settings = new LotterySettings();
       await settings.save();
@@ -401,12 +539,14 @@ router.post('/red-packet/claim', async (req, res) => {
         currentMonthGold: redPacketAmount,
         lastMonthGold: 0
       });
+      await userGold.save();
     } else {
       // 更新当月金币
-      userGold.currentMonthGold += redPacketAmount;
+      await UserGold.updateOne(
+        { userId },
+        { $inc: { currentMonthGold: redPacketAmount } }
+      );
     }
-    
-    await userGold.save();
     
     // 记录金币日志
     const GoldLog = require('../models/GoldLog');

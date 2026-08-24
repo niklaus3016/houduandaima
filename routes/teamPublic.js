@@ -10,10 +10,10 @@ const UserActivity = require('../models/UserActivity');
 const TeamGroup = require('../models/TeamGroup');
 
 const listCache = new Map();
-const LIST_CACHE_TTL = 60 * 1000;
+const LIST_CACHE_TTL = 5 * 60 * 1000;  // 5分钟（原60秒）
 
 const memberCache = new Map();
-const MEMBER_CACHE_TTL = 30 * 1000;
+const MEMBER_CACHE_TTL = 3 * 60 * 1000; // 3分钟（原30秒）
 
 function getBeijingDate() {
   const now = new Date();
@@ -118,39 +118,35 @@ router.get('/list', async (req, res) => {
 
     const allEmployeeIds = [...new Set(allEmployees.map(e => e.employeeId))];
 
-    const todayGoldAgg = await GoldLog.aggregate([
-      { $match: { employeeId: { $in: allEmployeeIds }, createTime: { $gte: todayStart } } },
-      { $group: { _id: '$employeeId', todayGold: { $sum: '$gold' }, todayCount: { $sum: 1 } } }
-    ]);
-
-    const yesterdayGoldAgg = await GoldLog.aggregate([
-      { $match: { employeeId: { $in: allEmployeeIds }, createTime: { $gte: yesterdayStart, $lt: yesterdayEnd } } },
-      { $group: { _id: '$employeeId', yesterdayGold: { $sum: '$gold' } } }
-    ]);
-
-    const monthGoldAgg = await GoldLog.aggregate([
-      { $match: { employeeId: { $in: allEmployeeIds }, createTime: { $gte: monthStart } } },
-      { $group: { _id: '$employeeId', monthGold: { $sum: '$gold' }, monthCount: { $sum: 1 } } }
-    ]);
-
-    const lastMonthGoldAgg = await GoldLog.aggregate([
-      { $match: { employeeId: { $in: allEmployeeIds }, createTime: { $gte: lastMonthStart, $lte: lastMonthEnd } } },
-      { $group: { _id: '$employeeId', lastMonthGold: { $sum: '$gold' } } }
-    ]);
-
-    const totalGoldAgg = await GoldLog.aggregate([
-      { $match: { employeeId: { $in: allEmployeeIds } } },
-      { $group: { _id: '$employeeId', totalGold: { $sum: '$gold' }, totalCount: { $sum: 1 }, totalEcpm: { $sum: { $ifNull: ['$ecpm', 0] } } } }
-    ]);
-
-    const todayLoginAgg = await LoginRecord.aggregate([
-      { $match: { employeeId: { $in: allEmployeeIds }, loginDate: { $gte: todayStart } } },
-      { $group: { _id: '$employeeId', count: { $sum: 1 } } }
-    ]);
-
-    const monthLoginAgg = await LoginRecord.aggregate([
-      { $match: { employeeId: { $in: allEmployeeIds }, loginDate: { $gte: monthStart } } },
-      { $group: { _id: '$employeeId', count: { $sum: 1 } } }
+    const [todayGoldAgg, yesterdayGoldAgg, monthGoldAgg, lastMonthGoldAgg, totalGoldAgg, todayLoginAgg, monthLoginAgg] = await Promise.all([
+      GoldLog.aggregate([
+        { $match: { employeeId: { $in: allEmployeeIds }, createTime: { $gte: todayStart } } },
+        { $group: { _id: '$employeeId', todayGold: { $sum: '$gold' }, todayCount: { $sum: 1 } } }
+      ]),
+      GoldLog.aggregate([
+        { $match: { employeeId: { $in: allEmployeeIds }, createTime: { $gte: yesterdayStart, $lt: yesterdayEnd } } },
+        { $group: { _id: '$employeeId', yesterdayGold: { $sum: '$gold' } } }
+      ]),
+      GoldLog.aggregate([
+        { $match: { employeeId: { $in: allEmployeeIds }, createTime: { $gte: monthStart } } },
+        { $group: { _id: '$employeeId', monthGold: { $sum: '$gold' }, monthCount: { $sum: 1 } } }
+      ]),
+      GoldLog.aggregate([
+        { $match: { employeeId: { $in: allEmployeeIds }, createTime: { $gte: lastMonthStart, $lte: lastMonthEnd } } },
+        { $group: { _id: '$employeeId', lastMonthGold: { $sum: '$gold' } } }
+      ]),
+      GoldLog.aggregate([
+        { $match: { employeeId: { $in: allEmployeeIds } } },
+        { $group: { _id: '$employeeId', totalGold: { $sum: '$gold' }, totalCount: { $sum: 1 }, totalEcpm: { $sum: { $ifNull: ['$ecpm', 0] } } } }
+      ]),
+      LoginRecord.aggregate([
+        { $match: { employeeId: { $in: allEmployeeIds }, loginDate: { $gte: todayStart } } },
+        { $group: { _id: '$employeeId', count: { $sum: 1 } } }
+      ]),
+      LoginRecord.aggregate([
+        { $match: { employeeId: { $in: allEmployeeIds }, loginDate: { $gte: monthStart } } },
+        { $group: { _id: '$employeeId', count: { $sum: 1 } } }
+      ])
     ]);
 
     const empStatsMap = {};
@@ -292,19 +288,19 @@ router.get('/:teamId/members', async (req, res) => {
     const todayStart = getBeijingStartOfDay(beijingNow);
     const monthStart = getBeijingStartOfMonth(beijingNow);
 
-    const todayGoldAgg = await GoldLog.aggregate([
-      { $match: { employeeId: { $in: employeeIds }, createTime: { $gte: todayStart } } },
-      { $group: { _id: '$employeeId', todayGold: { $sum: '$gold' }, todayCount: { $sum: 1 } } }
-    ]);
-
-    const monthGoldAgg = await GoldLog.aggregate([
-      { $match: { employeeId: { $in: employeeIds }, createTime: { $gte: monthStart } } },
-      { $group: { _id: '$employeeId', monthGold: { $sum: '$gold' }, monthCount: { $sum: 1 } } }
-    ]);
-
-    const totalGoldAgg = await GoldLog.aggregate([
-      { $match: { employeeId: { $in: employeeIds } } },
-      { $group: { _id: '$employeeId', totalGold: { $sum: '$gold' }, totalCount: { $sum: 1 } } }
+    const [todayGoldAgg, monthGoldAgg, totalGoldAgg] = await Promise.all([
+      GoldLog.aggregate([
+        { $match: { employeeId: { $in: employeeIds }, createTime: { $gte: todayStart } } },
+        { $group: { _id: '$employeeId', todayGold: { $sum: '$gold' }, todayCount: { $sum: 1 } } }
+      ]),
+      GoldLog.aggregate([
+        { $match: { employeeId: { $in: employeeIds }, createTime: { $gte: monthStart } } },
+        { $group: { _id: '$employeeId', monthGold: { $sum: '$gold' }, monthCount: { $sum: 1 } } }
+      ]),
+      GoldLog.aggregate([
+        { $match: { employeeId: { $in: employeeIds } } },
+        { $group: { _id: '$employeeId', totalGold: { $sum: '$gold' }, totalCount: { $sum: 1 } } }
+      ])
     ]);
 
     const userStatsMap = {};

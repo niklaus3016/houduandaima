@@ -31,4 +31,8 @@ const welfareLotteryRecordSchema = new mongoose.Schema({
   }
 });
 
+// 添加索引优化查询性能
+welfareLotteryRecordSchema.index({ employeeId: 1 });
+welfareLotteryRecordSchema.index({ employeeId: 1, createdAt: -1 });
+
 module.exports = mongoose.model('WelfareLotteryRecord', welfareLotteryRecordSchema);

@@ -17,6 +17,14 @@ const userActivitySchema = new mongoose.Schema({
     type: String,
     required: true
   },
+  platform: {
+    type: String,
+    default: ''
+  },
+  csjAppId: {
+    type: String,
+    default: ''
+  },
   createTime: {
     type: Date,
     default: Date.now
@@ -30,6 +38,8 @@ const userActivitySchema = new mongoose.Schema({
 // 复合索引
 userActivitySchema.index({ userId: 1, createTime: -1 });
 userActivitySchema.index({ employeeId: 1, createTime: -1 });
+userActivitySchema.index({ employeeId: 1, platform: 1, createTime: -1 });
+userActivitySchema.index({ employeeId: 1, platform: 1, csjAppId: 1, createTime: -1 });
 // 唯一索引：同一用户+IP+设备组合唯一
 userActivitySchema.index({ userId: 1, ip: 1, deviceId: 1 }, { unique: true });
 

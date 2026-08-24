@@ -1,0 +1,1175 @@
+const express = require('express');
+const router = express.Router();
+const WelfareWallet = require('../models/WelfareWallet');
+const WelfareLotteryRecord = require('../models/WelfareLotteryRecord');
+const WelfareWithdraw = require('../models/WelfareWithdraw');
+const WelfarePrize = require('../models/WelfarePrize');
+const WelfareSettings = require('../models/WelfareSettings');
+const UserGold = require('../models/UserGold');
+const GoldLog = require('../models/GoldLog');
+const authMiddleware = require('../middleware/auth');
+const financeMiddleware = require('../middleware/finance');
+
+// ========== 初始化奖品数据（只执行一次）==========
+let prizesInitialized = false;
+
+async function initPrizes() {
+  if (prizesInitialized) return;
+  try {
+    const count = await WelfarePrize.countDocuments();
+    if (count === 0) {
+      const prizes = [
+        { id: '1', name: '1克黄金', value: 500, type: 'gold', probability: 2 },
+        { id: '2', name: '1.68元', value: 1.68, type: 'cash', probability: 25 },
+        { id: '3', name: '88.8元', value: 88.8, type: 'cash', probability: 5 },
+        { id: '4', name: '6.88元', value: 6.88, type: 'cash', probability: 20 },
+        { id: '5', name: '千元手机', value: 1000, type: 'phone', probability: 1 },
+        { id: '6', name: '16.8元', value: 16.8, type: 'cash', probability: 15 },
+        { id: '7', name: '66.8元', value: 66.8, type: 'cash', probability: 10 },
+        { id: '8', name: '再接再厉', value: 0, type: 'encourage', probability: 22 }
+      ];
+      await WelfarePrize.insertMany(prizes);
+    }
+    prizesInitialized = true;
+  } catch (error) {
+    console.error('初始化奖品数据错误:', error);
+  }
+}
+
+// 调用初始化函数
+initPrizes();
+
+// ========== 奖品列表缓存（10分钟）==========
+let prizesCache = null;
+let prizesCacheTime = 0;
+
+async function getPrizes() {
+  const now = Date.now();
+  if (prizesCache && now - prizesCacheTime < 10 * 60 * 1000) {
+    return prizesCache;
+  }
+  const prizes = await WelfarePrize.find().sort({ id: 1 });
+  prizesCache = prizes;
+  prizesCacheTime = now;
+  return prizes;
+}
+
+// ========== 福利设置缓存（5分钟）==========
+let settingsCache = null;
+let settingsCacheTime = 0;
+
+async function getWelfareSettings() {
+  const now = Date.now();
+  if (settingsCache && now - settingsCacheTime < 5 * 60 * 1000) {
+    return settingsCache;
+  }
+  let settings = await WelfareSettings.findOne();
+  if (!settings) {
+    settings = new WelfareSettings();
+    await settings.save();
+  }
+  settingsCache = settings;
+  settingsCacheTime = now;
+  return settings;
+}
+
+// 1. 获取福利抽奖信息
+router.get('/welfare/lottery/info', authMiddleware, async (req, res) => {
+  try {
+    const { userId, employeeId } = req.query;
+    
+    if (!employeeId) {
+      return res.status(400).json({ success: false, message: '员工号不能为空' });
+    }
+    
+    // 获取今天的日期（北京时间）
+    const now = new Date();
+    const offset = 8 * 60 * 60 * 1000; // 北京时间UTC+8偏移量
+    const beijingTime = new Date(now.getTime() + offset);
+    const todayStr = beijingTime.toISOString().split('T')[0];
+    
+    let wallet = await WelfareWallet.findOne({ employeeId });
+    if (!wallet) {
+      // 如果用户钱包不存在，创建一个新的
+      wallet = new WelfareWallet({
+        userId: employeeId,
+        employeeId,
+        balance: 0,
+        chances: 0,  // 去掉初始3次，必须通过看广告获得
+        todayAdCount: 0,
+        lastAwardedThresholdIndex: -1,
+        countDate: todayStr
+      });
+      await wallet.save();
+    } else {
+      // 检查是否需要重置每日计数
+      if (wallet.countDate !== todayStr) {
+        wallet.todayAdCount = 0;
+        wallet.lastAwardedThresholdIndex = -1;
+        wallet.countDate = todayStr;
+        await wallet.save();
+      }
+    }
+    
+    // 获取阈值配置
+    let welfareSettings = await WelfareSettings.findOne();
+    if (!welfareSettings) {
+      welfareSettings = new WelfareSettings();
+      await welfareSettings.save();
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        balance: wallet.balance,
+        chances: wallet.chances,
+        todayAdCount: wallet.todayAdCount,
+        thresholds: welfareSettings.thresholds
+      }
+    });
+  } catch (error) {
+    console.error('获取福利抽奖信息错误:', error);
+    res.status(500).json({ success: false, message: '获取信息失败' });
+  }
+});
+
+// 2. 获取福利抽奖奖品列表
+router.get('/welfare/lottery/prizes', async (req, res) => {
+  try {
+    const prizes = await getPrizes();
+    
+    const formattedPrizes = prizes.map(prize => ({
+      id: prize.id,
+      name: prize.name,
+      value: prize.value,
+      type: prize.type,
+      probability: prize.probability
+    }));
+    
+    res.json({
+      success: true,
+      data: {
+        prizes: formattedPrizes
+      }
+    });
+  } catch (error) {
+    console.error('获取奖品列表错误:', error);
+    res.status(500).json({ success: false, message: '获取奖品列表失败' });
+  }
+});
+
+// 3. 领取福利抽奖 - 修复版本
+router.post('/welfare/lottery/claim', authMiddleware, async (req, res) => {
+  try {
+    const { userId, employeeId: bodyEmployeeId } = req.body;
+    const employeeId = bodyEmployeeId || req.user.username;
+
+    if (!employeeId) {
+      return res.status(400).json({ success: false, message: '员工号不能为空' });
+    }
+
+    let wallet;
+    if (userId && userId.trim()) {
+      wallet = await WelfareWallet.findOne({ userId, employeeId });
+    }
+    if (!wallet) {
+      wallet = await WelfareWallet.findOne({ employeeId });
+    }
+    if (!wallet) {
+      return res.status(400).json({ success: false, message: '用户钱包不存在' });
+    }
+
+    // 检查抽奖机会
+    if (wallet.chances <= 0) {
+      return res.status(400).json({ success: false, message: '抽奖机会不足' });
+    }
+    
+    // 从缓存获取奖品数据
+    const prizes = await getPrizes();
+    
+    // 计算总概率
+    const totalProbability = prizes.reduce((sum, prize) => sum + prize.probability, 0);
+    
+    // 生成随机数
+    const random = Math.random() * totalProbability;
+    
+    // 确定中奖结果
+    let currentProbability = 0;
+    let winningPrize = null;
+    
+    for (const prize of prizes) {
+      currentProbability += prize.probability;
+      if (random <= currentProbability) {
+        winningPrize = prize;
+        break;
+      }
+    }
+    
+    // 扣除抽奖机会
+    wallet.chances -= 1;
+    
+    // 如果中奖是现金，增加余额
+    if (winningPrize.type === 'cash' && winningPrize.value > 0) {
+      wallet.balance += winningPrize.value;
+    }
+    
+    // 保存钱包更新
+    await wallet.save();
+    
+    // 记录抽奖结果
+    const lotteryRecord = new WelfareLotteryRecord({
+      userId,
+      employeeId,
+      prizeId: winningPrize.id,
+      prizeName: winningPrize.name,
+      prizeValue: winningPrize.value,
+      prizeType: winningPrize.type
+    });
+    await lotteryRecord.save();
+    
+    res.json({
+      success: true,
+      data: {
+        result: {
+          id: winningPrize.id,
+          name: winningPrize.name,
+          value: winningPrize.value,
+          type: winningPrize.type
+        }
+      }
+    });
+  } catch (error) {
+    console.error('抽奖错误:', error);
+    res.status(500).json({ success: false, message: '抽奖失败' });
+  }
+});
+
+// 4. 获取福利抽奖记录
+router.get('/welfare/lottery/records', authMiddleware, async (req, res) => {
+  try {
+    const { userId, employeeId } = req.query;
+    
+    if (!employeeId) {
+      return res.status(400).json({ success: false, message: '员工号不能为空' });
+    }
+    
+    const records = await WelfareLotteryRecord.find({ employeeId })
+      .sort({ createdAt: -1 });
+    
+    const formattedRecords = records.map(record => ({
+      id: record._id.toString(),
+      time: record.createdAt,
+      name: record.prizeName,
+      value: record.prizeValue,
+      type: record.prizeType
+    }));
+    
+    res.json({
+      success: true,
+      data: {
+        records: formattedRecords
+      }
+    });
+  } catch (error) {
+    console.error('获取抽奖记录错误:', error);
+    res.status(500).json({ success: false, message: '获取记录失败' });
+  }
+});
+
+// 5. 福利钱包提现
+router.post('/welfare/withdraw', authMiddleware, async (req, res) => {
+  try {
+    const { amount, alipayAccount, alipayName } = req.body;
+    
+    if (!amount || !alipayAccount || !alipayName) {
+      return res.status(400).json({ success: false, message: '参数不能为空' });
+    }
+    
+    // 从token中获取用户信息
+    const userId = req.user.userId || req.user.id;
+    const employeeId = req.user.username;
+    
+    // 检查金额
+    if (amount <= 0) {
+      return res.status(400).json({ success: false, message: '提现金额必须大于0' });
+    }
+    
+    // 检查今日是否已提现（每日最多1次）
+    const now = new Date();
+    const offset = 8 * 60 * 60 * 1000; // 北京时间UTC+8偏移量
+    const beijingTime = new Date(now.getTime() + offset);
+    const todayStr = beijingTime.toISOString().split('T')[0];
+    
+    // 找到今天开始的UTC时间
+    const todayStartBeijing = new Date(beijingTime);
+    todayStartBeijing.setHours(0, 0, 0, 0);
+    const todayStartUTC = new Date(todayStartBeijing.getTime() - offset);
+    
+    const todayWithdrawals = await WelfareWithdraw.countDocuments({
+      employeeId,
+      status: { $ne: 'failed' },
+      createdAt: { $gte: todayStartUTC }
+    });
+    
+    if (todayWithdrawals > 0) {
+      return res.status(400).json({ success: false, message: '每日最多提现1次' });
+    }
+    
+    // 获取用户钱包（优先按userId+employeeId查询，如找不到则按employeeId查询）
+    let wallet = await WelfareWallet.findOne({ userId, employeeId });
+    if (!wallet) {
+      wallet = await WelfareWallet.findOne({ employeeId });
+    }
+    if (!wallet) {
+      return res.status(400).json({ success: false, message: '用户钱包不存在' });
+    }
+    
+    // 检查余额
+    if (wallet.balance < amount) {
+      return res.status(400).json({ success: false, message: '余额不足' });
+    }
+    
+    // 扣除余额
+    wallet.balance -= amount;
+    await wallet.save();
+    
+    // 创建提现记录
+    const withdrawRecord = new WelfareWithdraw({
+      userId,
+      employeeId,
+      amount,
+      alipayAccount,
+      alipayName,
+      status: 'processing'
+    });
+    await withdrawRecord.save();
+    
+    res.json({
+      success: true,
+      message: '提现申请已提交，等待处理',
+      data: {
+        success: true
+      }
+    });
+  } catch (error) {
+    console.error('提现错误:', error);
+    res.status(500).json({ success: false, message: '提现失败' });
+  }
+});
+
+// 6. 获取福利钱包余额
+router.get('/welfare/wallet/balance', authMiddleware, async (req, res) => {
+  try {
+    const { userId, employeeId } = req.query;
+    
+    if (!employeeId) {
+      return res.status(400).json({ success: false, message: '员工号不能为空' });
+    }
+    
+    let wallet = await WelfareWallet.findOne({ employeeId });
+    if (!wallet) {
+      // 如果用户钱包不存在，创建一个新的
+      wallet = new WelfareWallet({
+        userId: employeeId,
+        employeeId,
+        balance: 0,
+        chances: 0,
+        lastAwardedThresholdIndex: -1,
+        countDate: ''
+      });
+      await wallet.save();
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        balance: wallet.balance
+      }
+    });
+  } catch (error) {
+    console.error('获取余额错误:', error);
+    res.status(500).json({ success: false, message: '获取余额失败' });
+  }
+});
+
+// 6.1 获取用户抽奖状态（广告次数、抽奖机会、距离下次抽奖差多少）
+router.get('/welfare/wallet/status', authMiddleware, async (req, res) => {
+  try {
+    const employeeId = req.user.username;
+    
+    // 获取北京时间今日开始（用于查询GoldLog）
+    const now = new Date();
+    const beijingNow = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+    const todayBeijing = new Date(beijingNow);
+    todayBeijing.setHours(0, 0, 0, 0);
+    const todayStart = new Date(todayBeijing.getTime() - 8 * 60 * 60 * 1000);
+    
+    // 查询今日广告记录数（使用employeeId直接查询，与today-stats接口保持一致）
+    const todayLogs = await GoldLog.find({
+      employeeId,
+      createTime: { $gte: todayStart }
+    });
+    const todayAdCount = todayLogs.length;
+    
+    // 获取钱包信息（主要用于抽奖机会）
+    let wallet = await WelfareWallet.findOne({ employeeId });
+    if (!wallet) {
+      wallet = new WelfareWallet({
+        userId: employeeId,
+        employeeId,
+        balance: 0,
+        chances: 0,
+        lastAwardedThresholdIndex: -1,
+        countDate: ''
+      });
+      await wallet.save();
+    }
+    
+    // 检查是否需要重置抽奖机会发放状态（北京时间每日0点重置）
+    const todayStr = beijingNow.toISOString().split('T')[0];
+    if (wallet.countDate !== todayStr) {
+      wallet.countDate = todayStr;
+      wallet.lastAwardedThresholdIndex = -1;
+      wallet.chances = 0;  // 每日0点重置抽奖机会
+      await wallet.save();
+    }
+    
+    // 获取阈值配置
+    let settings = await WelfareSettings.findOne();
+    if (!settings) {
+      settings = new WelfareSettings();
+      await settings.save();
+    }
+    
+    // 计算抽奖机会（根据今日广告条数自动发放）
+    const thresholds = settings.thresholds || [];
+    let newChances = wallet.chances;
+    
+    // 确保 lastAwardedThresholdIndex 有效
+    if (wallet.lastAwardedThresholdIndex === undefined || wallet.lastAwardedThresholdIndex === null) {
+      wallet.lastAwardedThresholdIndex = -1;
+    }
+    
+    for (let i = wallet.lastAwardedThresholdIndex; i < thresholds.length; i++) {
+      const threshold = thresholds[i];
+      if (!threshold || threshold.adCount === undefined) continue;
+      if (todayAdCount >= threshold.adCount) {
+        newChances += threshold.giveChances || 0;
+        wallet.lastAwardedThresholdIndex = i + 1;
+      } else {
+        break;
+      }
+    }
+    
+    if (newChances !== wallet.chances) {
+      wallet.chances = newChances;
+      await wallet.save();
+    }
+    
+    // 计算距离下次抽奖还差多少
+    let nextThreshold = null;
+    let remaining = 0;
+    
+    for (let i = thresholds.length - 1; i >= 0; i--) {
+      if (todayAdCount >= thresholds[i].adCount) {
+        if (i === thresholds.length - 1) {
+          remaining = 0;
+          nextThreshold = null;
+        } else {
+          nextThreshold = thresholds[i + 1];
+          remaining = nextThreshold.adCount - todayAdCount;
+        }
+        break;
+      }
+    }
+    
+    if (!nextThreshold && thresholds.length > 0 && todayAdCount < thresholds[0].adCount) {
+      nextThreshold = thresholds[0];
+      remaining = nextThreshold.adCount - todayAdCount;
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        todayAdCount: todayAdCount,      // 与today-stats接口一致
+        chances: wallet.chances,         // 当前抽奖机会
+        nextThreshold: nextThreshold ? {
+          adCount: nextThreshold.adCount,
+          giveChances: nextThreshold.giveChances
+        } : null,
+        remaining: remaining,
+        thresholds: thresholds           // 阈值配置列表（用于前端动态渲染）
+      }
+    });
+  } catch (error) {
+    console.error('获取抽奖状态错误:', error);
+    res.status(500).json({ success: false, message: '获取抽奖状态失败' });
+  }
+});
+
+// 7. 获取提现记录
+router.get('/welfare/withdraw/records', authMiddleware, async (req, res) => {
+  try {
+    // 从token中获取员工号
+    const employeeId = req.user.username;
+    
+    const records = await WelfareWithdraw.find({ employeeId })
+      .sort({ createdAt: -1 });
+    
+    const statusMap = {
+      processing: { text: '处理中', color: 'text-blue-400' },
+      completed: { text: '已到账', color: 'text-green-400' },
+      failed: { text: '失败', color: 'text-red-400' }
+    };
+    
+    const formattedRecords = records.map(record => ({
+      id: record._id.toString(),
+      time: record.createdAt,
+      amount: record.amount,
+      status: record.status,
+      statusText: statusMap[record.status].text,
+      statusColor: statusMap[record.status].color
+    }));
+    
+    res.json({
+      success: true,
+      data: {
+        records: formattedRecords
+      }
+    });
+  } catch (error) {
+    console.error('获取提现记录错误:', error);
+    res.status(500).json({ success: false, message: '获取提现记录失败' });
+  }
+});
+
+// 8. 绑定支付宝信息
+router.post('/welfare/bind-alipay', authMiddleware, async (req, res) => {
+  try {
+    const { userId, employeeId: bodyEmployeeId, alipayName, alipayAccount } = req.body;
+    const employeeId = bodyEmployeeId || req.user.username;
+
+    if (!employeeId || !alipayName || !alipayAccount) {
+      return res.status(400).json({ success: false, message: '参数不能为空' });
+    }
+    
+    // 查找或创建用户钱包（兼容逻辑）
+    let wallet;
+    if (userId && userId.trim()) {
+      wallet = await WelfareWallet.findOne({ userId, employeeId });
+    }
+    if (!wallet) {
+      wallet = await WelfareWallet.findOne({ employeeId });
+    }
+    if (!wallet) {
+      wallet = new WelfareWallet({
+        userId: employeeId,
+        employeeId,
+        balance: 0,
+        chances: 0
+      });
+    }
+    
+    // 更新支付宝信息
+    wallet.alipayName = alipayName;
+    wallet.alipayAccount = alipayAccount;
+    wallet.updatedAt = new Date();
+    await wallet.save();
+    
+    res.json({
+      success: true,
+      message: '绑定成功',
+      data: {
+        alipayName,
+        alipayAccount
+      }
+    });
+  } catch (error) {
+    console.error('绑定支付宝错误:', error);
+    res.status(500).json({ success: false, message: '绑定失败' });
+  }
+});
+
+// 9. 获取绑定的支付宝信息
+router.get('/welfare/get-alipay', authMiddleware, async (req, res) => {
+  try {
+    const { userId, employeeId } = req.query;
+    
+    if (!employeeId) {
+      return res.status(400).json({ success: false, message: '员工号不能为空' });
+    }
+    
+    // 从用户钱包中获取支付宝信息
+    const wallet = await WelfareWallet.findOne({ employeeId });
+    
+    if (!wallet) {
+      return res.status(400).json({ success: false, message: '用户钱包不存在' });
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        alipayName: wallet.alipayName || '',
+        alipayAccount: wallet.alipayAccount || ''
+      }
+    });
+  } catch (error) {
+    console.error('获取支付宝信息错误:', error);
+    res.status(500).json({ success: false, message: '获取支付宝信息失败' });
+  }
+});
+
+// 10. 超管调整奖品概率
+router.post('/welfare/admin/update-prize', financeMiddleware, async (req, res) => {
+  try {
+    const { id, probability } = req.body;
+    
+    if (!id || probability === undefined) {
+      return res.status(400).json({ success: false, message: '奖品ID和概率不能为空' });
+    }
+    
+    // 检查概率是否在合理范围内
+    if (probability < 0 || probability > 100) {
+      return res.status(400).json({ success: false, message: '概率必须在0-100之间' });
+    }
+    
+    // 更新奖品概率
+    const prize = await WelfarePrize.findOneAndUpdate(
+      { id },
+      { probability, updatedAt: new Date() },
+      { new: true }
+    );
+    
+    if (!prize) {
+      return res.status(400).json({ success: false, message: '奖品不存在' });
+    }
+    
+    res.json({
+      success: true,
+      message: '奖品概率更新成功',
+      data: {
+        id: prize.id,
+        name: prize.name,
+        probability: prize.probability
+      }
+    });
+  } catch (error) {
+    console.error('更新奖品概率错误:', error);
+    res.status(500).json({ success: false, message: '更新奖品概率失败' });
+  }
+});
+
+// 11. 超管批量更新奖品概率
+router.post('/welfare/admin/update-prizes', financeMiddleware, async (req, res) => {
+  try {
+    const { prizes } = req.body;
+    
+    if (!prizes || !Array.isArray(prizes)) {
+      return res.status(400).json({ success: false, message: '奖品列表不能为空且必须是数组' });
+    }
+    
+    // 验证每个奖品
+    for (const prize of prizes) {
+      if (!prize.id || prize.probability === undefined) {
+        return res.status(400).json({ success: false, message: '每个奖品必须包含id和probability' });
+      }
+      if (prize.probability < 0 || prize.probability > 100) {
+        return res.status(400).json({ success: false, message: '概率必须在0-100之间' });
+      }
+    }
+    
+    // 批量更新
+    const updatePromises = prizes.map(prize => {
+      return WelfarePrize.findOneAndUpdate(
+        { id: prize.id },
+        { probability: prize.probability, updatedAt: new Date() },
+        { new: true }
+      );
+    });
+    
+    const results = await Promise.all(updatePromises);
+    
+    // 检查是否有更新失败的
+    const failedIds = [];
+    const successPrizes = [];
+    
+    for (let i = 0; i < prizes.length; i++) {
+      if (results[i]) {
+        successPrizes.push({
+          id: results[i].id,
+          name: results[i].name,
+          probability: results[i].probability
+        });
+      } else {
+        failedIds.push(prizes[i].id);
+      }
+    }
+    
+    if (failedIds.length > 0) {
+      return res.status(200).json({
+        success: true,
+        message: `部分奖品更新成功，${failedIds.length}个奖品不存在`,
+        data: {
+          successPrizes,
+          failedIds
+        }
+      });
+    }
+    
+    res.json({
+      success: true,
+      message: '所有奖品概率更新成功',
+      data: {
+        prizes: successPrizes
+      }
+    });
+  } catch (error) {
+    console.error('批量更新奖品概率错误:', error);
+    res.status(500).json({ success: false, message: '批量更新奖品概率失败' });
+  }
+});
+
+// 12. 超管更新奖品信息（包含名称、金额、类型，概率请使用批量更新接口）
+router.post('/welfare/admin/prize', financeMiddleware, async (req, res) => {
+  try {
+    const { id, name, value, type } = req.body;
+    
+    if (!id) {
+      return res.status(400).json({ success: false, message: '奖品ID不能为空' });
+    }
+    
+    const updateData = {};
+    if (name !== undefined) updateData.name = name;
+    if (value !== undefined) updateData.value = value;
+    if (type !== undefined) updateData.type = type;
+    updateData.updatedAt = new Date();
+    
+    // 检查是否有任何更新字段
+    if (Object.keys(updateData).length === 1 && updateData.updatedAt) {
+      return res.status(400).json({ success: false, message: '至少需要更新一个字段（name/value/type）' });
+    }
+    
+    const prize = await WelfarePrize.findOneAndUpdate(
+      { id },
+      updateData,
+      { new: true }
+    );
+    
+    if (!prize) {
+      return res.status(400).json({ success: false, message: '奖品不存在' });
+    }
+    
+    res.json({
+      success: true,
+      message: '奖品信息更新成功',
+      data: {
+        id: prize.id,
+        name: prize.name,
+        value: prize.value,
+        type: prize.type,
+        probability: prize.probability
+      }
+    });
+  } catch (error) {
+    console.error('更新奖品信息错误:', error);
+    res.status(500).json({ success: false, message: '更新奖品信息失败' });
+  }
+});
+
+// 11. 超管获取所有奖品列表（用于管理）
+router.get('/welfare/admin/prizes', financeMiddleware, async (req, res) => {
+  try {
+    const prizes = await WelfarePrize.find().sort({ id: 1 });
+    
+    const formattedPrizes = prizes.map(prize => ({
+      id: prize.id,
+      name: prize.name,
+      value: prize.value,
+      type: prize.type,
+      probability: prize.probability
+    }));
+    
+    res.json({
+      success: true,
+      data: {
+        prizes: formattedPrizes
+      }
+    });
+  } catch (error) {
+    console.error('获取奖品列表错误:', error);
+    res.status(500).json({ success: false, message: '获取奖品列表失败' });
+  }
+});
+
+// 12. 超管获取待处理的提现申请列表
+router.get('/welfare/admin/withdraw/list', financeMiddleware, async (req, res) => {
+  try {
+    const withdrawals = await WelfareWithdraw.find({ status: 'processing' })
+      .sort({ createdAt: -1 });
+    
+    const formattedWithdrawals = withdrawals.map(withdrawal => ({
+      id: withdrawal._id.toString(),
+      userId: withdrawal.userId,
+      employeeId: withdrawal.employeeId,
+      amount: withdrawal.amount,
+      alipayAccount: withdrawal.alipayAccount,
+      alipayName: withdrawal.alipayName,
+      time: withdrawal.createdAt,
+      status: withdrawal.status
+    }));
+    
+    res.json({
+      success: true,
+      data: {
+        withdrawals: formattedWithdrawals
+      }
+    });
+  } catch (error) {
+    console.error('获取待处理提现列表错误:', error);
+    res.status(500).json({ success: false, message: '获取提现列表失败' });
+  }
+});
+
+// 13. 超管处理提现申请
+router.post('/welfare/admin/withdraw/process', financeMiddleware, async (req, res) => {
+  try {
+    const { id, status } = req.body;
+    
+    if (!id || !status) {
+      return res.status(400).json({ success: false, message: '提现申请ID和处理状态不能为空' });
+    }
+    
+    // 检查状态是否合法
+    if (!['completed', 'failed'].includes(status)) {
+      return res.status(400).json({ success: false, message: '处理状态必须是completed或failed' });
+    }
+    
+    // 更新提现状态
+    const withdrawal = await WelfareWithdraw.findByIdAndUpdate(
+      id,
+      { status, updatedAt: new Date() },
+      { new: true }
+    );
+    
+    if (!withdrawal) {
+      return res.status(400).json({ success: false, message: '提现申请不存在' });
+    }
+    
+    // 如果处理失败，恢复用户余额
+    if (status === 'failed') {
+      let wallet = await WelfareWallet.findOne({
+        userId: withdrawal.userId,
+        employeeId: withdrawal.employeeId
+      });
+      
+      if (!wallet) {
+        wallet = await WelfareWallet.findOne({
+          employeeId: withdrawal.employeeId
+        });
+      }
+      
+      if (wallet) {
+        wallet.balance += withdrawal.amount;
+        await wallet.save();
+      }
+    }
+    
+    res.json({
+      success: true,
+      message: '提现申请处理成功',
+      data: {
+        id: withdrawal._id.toString(),
+        status: withdrawal.status
+      }
+    });
+  } catch (error) {
+    console.error('处理提现申请错误:', error);
+    res.status(500).json({ success: false, message: '处理提现申请失败' });
+  }
+});
+
+// 14. 超管获取所有提现记录
+router.get('/welfare/admin/withdraw/records', financeMiddleware, async (req, res) => {
+  try {
+    const withdrawals = await WelfareWithdraw.find()
+      .sort({ createdAt: -1 });
+    
+    const statusMap = {
+      processing: { text: '处理中', color: 'text-blue-400' },
+      completed: { text: '已到账', color: 'text-green-400' },
+      failed: { text: '失败', color: 'text-red-400' }
+    };
+    
+    const formattedWithdrawals = withdrawals.map(withdrawal => ({
+      id: withdrawal._id.toString(),
+      userId: withdrawal.userId,
+      employeeId: withdrawal.employeeId,
+      amount: withdrawal.amount,
+      alipayAccount: withdrawal.alipayAccount,
+      alipayName: withdrawal.alipayName,
+      time: withdrawal.createdAt,
+      status: withdrawal.status,
+      statusText: statusMap[withdrawal.status].text,
+      statusColor: statusMap[withdrawal.status].color
+    }));
+    
+    res.json({
+      success: true,
+      data: {
+        withdrawals: formattedWithdrawals
+      }
+    });
+  } catch (error) {
+    console.error('获取提现记录错误:', error);
+    res.status(500).json({ success: false, message: '获取提现记录失败' });
+  }
+});
+
+// 15. 超管获取福利抽奖配置
+router.get('/welfare/admin/settings', financeMiddleware, async (req, res) => {
+  try {
+    let settings = await WelfareSettings.findOne();
+    if (!settings) {
+      settings = new WelfareSettings();
+      await settings.save();
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        thresholds: settings.thresholds,
+        updatedAt: settings.updatedAt
+      }
+    });
+  } catch (error) {
+    console.error('获取福利配置错误:', error);
+    res.status(500).json({ success: false, message: '获取配置失败' });
+  }
+});
+
+// 16. 超管更新福利抽奖配置
+router.post('/welfare/admin/settings', financeMiddleware, async (req, res) => {
+  try {
+    const { thresholds } = req.body;
+    
+    if (!thresholds || !Array.isArray(thresholds)) {
+      return res.status(400).json({ success: false, message: '阈值配置不能为空且必须是数组' });
+    }
+    
+    // 验证阈值配置格式
+    for (const threshold of thresholds) {
+      if (!threshold.adCount || threshold.adCount <= 0 || !Number.isInteger(threshold.adCount)) {
+        return res.status(400).json({ success: false, message: '广告次数必须是正整数' });
+      }
+      if (!threshold.giveChances || threshold.giveChances <= 0 || !Number.isInteger(threshold.giveChances)) {
+        return res.status(400).json({ success: false, message: '抽奖机会必须是正整数' });
+      }
+    }
+    
+    // 按adCount从小到大排序
+    thresholds.sort((a, b) => a.adCount - b.adCount);
+    
+    let settings = await WelfareSettings.findOne();
+    if (!settings) {
+      settings = new WelfareSettings();
+    }
+    
+    settings.thresholds = thresholds;
+    await settings.save();
+    
+    res.json({
+      success: true,
+      message: '配置更新成功',
+      data: {
+        thresholds: settings.thresholds
+      }
+    });
+  } catch (error) {
+    console.error('更新福利配置错误:', error);
+    res.status(500).json({ success: false, message: '更新配置失败' });
+  }
+});
+
+// 17. 超管手动给用户增加抽奖机会
+router.post('/welfare/admin/add-chances', financeMiddleware, async (req, res) => {
+  try {
+    const { employeeId, chances } = req.body;
+    
+    if (!employeeId) {
+      return res.status(400).json({ success: false, message: '员工号不能为空' });
+    }
+    if (!chances || chances <= 0 || !Number.isInteger(chances)) {
+      return res.status(400).json({ success: false, message: '抽奖机会必须是正整数' });
+    }
+    
+    // 获取今天的日期（北京时间）
+    const now = new Date();
+    const offset = 8 * 60 * 60 * 1000; // 北京时间UTC+8偏移量
+    const beijingTime = new Date(now.getTime() + offset);
+    const todayStr = beijingTime.toISOString().split('T')[0];
+    
+    let wallet = await WelfareWallet.findOne({ employeeId });
+    if (!wallet) {
+      wallet = new WelfareWallet({
+        userId: '',
+        employeeId,
+        balance: 0,
+        chances: 0,
+        todayAdCount: 0,
+        lastAwardedThresholdIndex: -1,
+        countDate: todayStr
+      });
+    }
+    
+    wallet.chances += chances;
+    await wallet.save();
+    
+    res.json({
+      success: true,
+      message: '抽奖机会添加成功',
+      data: {
+        employeeId,
+        addedChances: chances,
+        currentChances: wallet.chances
+      }
+    });
+  } catch (error) {
+    console.error('添加抽奖机会错误:', error);
+    res.status(500).json({ success: false, message: '添加抽奖机会失败' });
+  }
+});
+
+// 18. 超管获取用户福利钱包信息
+router.get('/welfare/admin/user-wallet', financeMiddleware, async (req, res) => {
+  try {
+    const { employeeId } = req.query;
+    
+    if (!employeeId) {
+      return res.status(400).json({ success: false, message: '员工号不能为空' });
+    }
+    
+    const wallet = await WelfareWallet.findOne({ employeeId });
+    if (!wallet) {
+      return res.status(400).json({ success: false, message: '用户钱包不存在' });
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        userId: wallet.userId,
+        employeeId: wallet.employeeId,
+        balance: wallet.balance,
+        chances: wallet.chances,
+        todayAdCount: wallet.todayAdCount,
+        lastAwardedThresholdIndex: wallet.lastAwardedThresholdIndex,
+        countDate: wallet.countDate
+      }
+    });
+  } catch (error) {
+    console.error('获取用户钱包错误:', error);
+    res.status(500).json({ success: false, message: '获取用户钱包失败' });
+  }
+});
+
+// 19. 超管获取所有抽奖记录
+router.get('/welfare/admin/lottery/records', financeMiddleware, async (req, res) => {
+  try {
+    const { startDate, endDate, employeeId, page = 1, limit = 50 } = req.query;
+    
+    // 构建查询条件
+    const query = {};
+    
+    // 日期筛选（北京时间）
+    if (startDate || endDate) {
+      query.createdAt = {};
+      const offset = 8 * 60 * 60 * 1000; // 北京时间UTC+8偏移量
+      
+      if (startDate) {
+        // 北京时间当天00:00:00对应的UTC时间
+        const startBeijing = new Date(startDate + 'T00:00:00');
+        const startUTC = new Date(startBeijing.getTime() - offset);
+        query.createdAt.$gte = startUTC;
+      }
+      
+      if (endDate) {
+        // 北京时间当天23:59:59.999对应的UTC时间
+        const endBeijing = new Date(endDate + 'T23:59:59.999');
+        const endUTC = new Date(endBeijing.getTime() - offset);
+        query.createdAt.$lte = endUTC;
+      }
+    }
+    
+    // 员工号筛选
+    if (employeeId) {
+      query.employeeId = employeeId;
+    }
+    
+    // 获取记录
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const records = await WelfareLotteryRecord.find(query)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+    
+    // 获取统计数据
+    const stats = await WelfareLotteryRecord.aggregate([
+      { $match: query },
+      {
+        $group: {
+          _id: null,
+          totalCount: { $sum: 1 },
+          totalPrize: { $sum: '$prizeValue' }
+        }
+      }
+    ]);
+    
+    // 获取总数
+    const total = await WelfareLotteryRecord.countDocuments(query);
+    
+    const formattedRecords = records.map(record => ({
+      id: record._id.toString(),
+      employeeId: record.employeeId,
+      time: record.createdAt,
+      prizeName: record.prizeName,
+      prizeValue: record.prizeValue,
+      prizeType: record.prizeType
+    }));
+    
+    res.json({
+      success: true,
+      data: {
+        records: formattedRecords,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total: total,
+          totalPages: Math.ceil(total / parseInt(limit))
+        },
+        statistics: {
+          totalCount: stats[0]?.totalCount || 0,
+          totalPrize: stats[0]?.totalPrize || 0
+        }
+      }
+    });
+  } catch (error) {
+    console.error('获取抽奖记录错误:', error);
+    res.status(500).json({ success: false, message: '获取抽奖记录失败' });
+  }
+});
+
+// 20. 超管重置所有用户抽奖次数
+router.post('/welfare/admin/reset-chances', financeMiddleware, async (req, res) => {
+  try {
+    const result = await WelfareWallet.updateMany({}, { $set: { chances: 0 } });
+    
+    res.json({
+      success: true,
+      message: `已重置 ${result.modifiedCount} 个用户的抽奖次数为 0`
+    });
+  } catch (error) {
+    console.error('重置抽奖次数错误:', error);
+    res.status(500).json({ success: false, message: '重置抽奖次数失败' });
+  }
+});
+
+module.exports = router;

@@ -6,6 +6,7 @@ const SystemConfig = require('../models/SystemConfig');
 const Admin = require('../models/Admin');
 const Employee = require('../models/Employee');
 const authMiddleware = require('../middleware/auth');
+const { clear } = require('../utils/cache');
 
 // 初始化提现开关配置
 const initWithdrawConfig = async () => {
@@ -346,6 +347,20 @@ router.post('/:id/approve', authMiddleware, async (req, res) => {
     record.statusText = '已通过';
     record.processTime = new Date();
     await record.save();
+
+    // 通过后清理相关缓存，确保 availableBalance 实时正确
+    if (record.type === 'admin') {
+      const admin = await Admin.findOne({ username: record.userId });
+      if (admin) {
+        try {
+          clear(`team_leader_commission_v2_${admin._id}_${admin._id}`);
+          clear(`group-leader-commission-stats-v2-${admin._id}`);
+          clear(`super_dividend_summary_admin_`);
+        } catch (e) {
+          console.warn('[withdraw/approve] 清除缓存失败:', e.message || e);
+        }
+      }
+    }
     
     res.json({
       success: true,
@@ -377,13 +392,23 @@ router.post('/:id/reject', authMiddleware, async (req, res) => {
           admin._id,
           { $inc: { commission: record.amount } }
         );
+        // 清理管理员相关的缓存（与 submit 保持一致）
+        try {
+          clear(`team_leader_commission_v2_${admin._id}_${admin._id}`);
+          clear(`group-leader-commission-stats-v2-${admin._id}`);
+          clear(`super_dividend_summary_admin_`);
+        } catch (e) {
+          console.warn('[withdraw/reject] 清除缓存失败:', e.message || e);
+        }
       }
     } else {
       // 员工提现：返还金币（包括type为undefined的旧记录）
-      await UserGold.updateOne(
-        { employeeId: record.employeeId },
-        { $inc: { lastMonthGold: record.goldAmount } }
-      );
+      if (record.employeeId) {
+        await UserGold.updateOne(
+          { employeeId: record.employeeId },
+          { $inc: { lastMonthGold: record.goldAmount } }
+        );
+      }
     }
     
     record.status = 2;
@@ -402,13 +427,13 @@ router.post('/:id/reject', authMiddleware, async (req, res) => {
   }
 });
 
-// 管理员提现接口（团队长、组长等）
+// 管理员提现接口（团队长、组长、高管等）
 router.post('/admin/submit', authMiddleware, async (req, res) => {
   try {
-    const { amount, alipayAccount, alipayName, employeeId, lastMonthCommission } = req.body;
+    const { amount, alipayAccount, alipayName, employeeId } = req.body;
     const adminId = req.user.id;
     
-    if (!amount || !alipayAccount || !alipayName || !employeeId || lastMonthCommission === undefined) {
+    if (!amount || !alipayAccount || !alipayName || !employeeId) {
       return res.status(400).json({ success: false, message: '缺少必要参数' });
     }
     
@@ -417,7 +442,6 @@ router.post('/admin/submit', authMiddleware, async (req, res) => {
     let withdrawEnabled = true;
     
     if (config) {
-      // 处理两种情况：config.value是布尔值或对象
       if (typeof config.value === 'boolean') {
         withdrawEnabled = config.value;
       } else if (typeof config.value === 'object' && config.value !== null) {
@@ -435,51 +459,102 @@ router.post('/admin/submit', authMiddleware, async (req, res) => {
       return res.status(404).json({ success: false, message: '管理员不存在' });
     }
     
-    // 检查是否是本月第一次提现，如果commission为0则用lastMonthCommission初始化
-    let availableBalance = admin.commission;
-    if (availableBalance === 0) {
-      // 使用UTC时间计算本月开始，避免时区问题
-      const nowUTC = new Date();
-      const monthStartUTC = new Date(Date.UTC(nowUTC.getUTCFullYear(), nowUTC.getUTCMonth(), 1));
-      
-      const thisMonthWithdrawals = await WithdrawRecord.countDocuments({
-        userId: admin.username,
-        type: 'admin',
-        createTime: { $gte: monthStartUTC }
-      });
-      
-      if (thisMonthWithdrawals === 0) {
-        // 本月第一次提现，用lastMonthCommission初始化
-        availableBalance = lastMonthCommission;
+    // 计算本月时间范围（北京时间）
+    // 现在是8月，用户提现的是上月（7月）的收益，所以要扣减本月（8月）已发起的提现
+    const now = new Date();
+    const bjNow = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+    const curYear = bjNow.getUTCFullYear();
+    const curMonth = bjNow.getUTCMonth() + 1; // 1-based
+    
+    let currentMonthStart, currentMonthEnd;
+    if (curMonth === 12) {
+      currentMonthStart = new Date(Date.UTC(curYear, 11, 1)); // 12月1日
+      currentMonthEnd = new Date(Date.UTC(curYear + 1, 0, 1)); // 1月1日
+    } else {
+      currentMonthStart = new Date(Date.UTC(curYear, curMonth - 1, 1)); // 本月1日
+      currentMonthEnd = new Date(Date.UTC(curYear, curMonth, 1)); // 下月1日
+    }
+    
+    // 计算本月已提现金额（待处理 + 已通过，排除已拒绝）
+    let currentMonthWithdrawn = 0;
+    try {
+      const wdAgg = await WithdrawRecord.aggregate([
+        { $match: { 
+          userId: admin.username, 
+          type: 'admin', 
+          status: { $in: [0, 1] },
+          createTime: { $gte: currentMonthStart, $lt: currentMonthEnd }
+        } },
+        { $group: { _id: null, sumAmount: { $sum: '$amount' } } }
+      ]).exec();
+      currentMonthWithdrawn = +(wdAgg?.[0]?.sumAmount || 0);
+    } catch (e) {
+      console.warn('[withdraw/admin/submit] 算本月已提现金额时警告：', e.message || e);
+    }
+
+    // 获取管理员角色
+    const role = String(admin.role || '').toUpperCase();
+    const isAdminManager = role === 'ADMIN_MANAGER';
+    const isSuperAdmin = role === 'SUPER_ADMIN';
+    const isTlOrGl = role === 'NORMAL_ADMIN' || role === 'GROUP_LEADER';
+    
+    let availableBalance;
+    const dashboard = require('./dashboard');
+    
+    if (isAdminManager || isSuperAdmin) {
+      // 高管/超管：使用动态计算的 dividendTotal
+      const scopeTeamIds = admin.managedTeamIds || [];
+      const kpi = await dashboard.computeSuperKpi('lastMonth', scopeTeamIds);
+      availableBalance = Math.max(0, kpi.dividendTotal - currentMonthWithdrawn);
+    } else if (isTlOrGl) {
+      // TL/GL：使用动态计算的 lastMonth teamCommission
+      const scopeKind = role === 'GROUP_LEADER' ? 'GL' : 'TL';
+      const scope = { kind: scopeKind, adminId: String(admin._id) };
+      if (role === 'GROUP_LEADER' && admin.teamGroupId) {
+        scope.teamGroupId = admin.teamGroupId;
       }
+      const kpi = await dashboard.computeNewKpi(scope, 'lastMonth');
+      availableBalance = Math.max(0, (kpi.teamCommission || 0) - currentMonthWithdrawn);
+    } else {
+      // 其他角色：使用 Admin.commission 字段（兼容）
+      availableBalance = Math.max(0, (+admin.commission || 0) - currentMonthWithdrawn);
     }
-    
-    // 检查余额
-    if (availableBalance < amount) {
-      return res.status(400).json({ success: false, message: '余额不足' });
+
+    // 检查余额是否充足
+    if (amount > availableBalance) {
+      return res.status(400).json({ 
+        success: false, 
+        message: `余额不足，可提现金额: ${availableBalance.toFixed(2)}` 
+      });
     }
-    
-    // 扣除提成（原子操作）
-    await Admin.findByIdAndUpdate(
-      adminId,
-      { $set: { commission: availableBalance - amount } }
-    );
     
     // 创建提现记录（直接标记为待处理）
     const withdrawRecord = new WithdrawRecord({
-      userId: admin.username, // 使用管理员用户名作为userId
-      employeeId: employeeId, // 使用前端传入的员工号
+      userId: admin.username,
+      employeeId: employeeId,
       amount,
-      goldAmount: 0, // 管理员不需要金币
+      goldAmount: 0,
       alipayAccount,
       alipayName,
       status: 0,
       statusText: '待处理',
       createTime: new Date(),
-      type: 'admin' // 标记为管理员提现
+      type: 'admin'
     });
     
     await withdrawRecord.save();
+    
+    // 不再扣减 Admin.commission 字段
+    // availableBalance 已改为动态计算：上月收益 - 待处理提现
+    // Admin.commission 字段现在专门用于存储分成比例，不再用于可提现余额
+    
+    try {
+      clear(`team_leader_commission_v2_${adminId}_${adminId}`);
+      clear(`group-leader-commission-stats-v2-${adminId}`);
+      clear(`super_dividend_summary_admin_`);
+    } catch (e) {
+      console.warn('[withdraw/admin/submit] 清除缓存失败:', e.message || e);
+    }
     
     res.json({
       success: true,

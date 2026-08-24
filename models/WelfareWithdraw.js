@@ -36,4 +36,8 @@ const welfareWithdrawSchema = new mongoose.Schema({
   }
 });
 
+// 添加索引优化查询性能
+welfareWithdrawSchema.index({ employeeId: 1 });
+welfareWithdrawSchema.index({ status: 1, createdAt: -1 });
+
 module.exports = mongoose.model('WelfareWithdraw', welfareWithdrawSchema);

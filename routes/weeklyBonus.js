@@ -6,12 +6,7 @@ const GoldLog = require('../models/GoldLog');
 const Employee = require('../models/Employee');
 const UserGold = require('../models/UserGold');
 const authMiddleware = require('../middleware/auth');
-
-// 获取北京时间
-function getBeijingDate() {
-  const now = new Date();
-  return new Date(now.getTime() + 8 * 60 * 60 * 1000);
-}
+const { getBeijingDate } = require('../utils/date');
 
 // 获取当前周（YYYY-WW 格式，北京时间，周一为一周开始）
 function getCurrentWeek() {
@@ -89,17 +84,15 @@ router.post('/claim', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, message: '本周无目标任务' });
     }
     
-    // 计算本周收益条数
+    // 计算本周收益条数（使用countDocuments避免全量拉取）
     const weekRange = getWeekRange(currentWeek);
-    const goldLogs = await GoldLog.find({
+    const currentCount = await GoldLog.countDocuments({
       userId: userGold.userId,
       createTime: {
         $gte: weekRange.start,
         $lt: weekRange.end
       }
     });
-    
-    const currentCount = goldLogs.length;
     
     if (currentCount < weeklyTarget.targetCount) {
       return res.status(400).json({ success: false, message: '未达到目标条数' });
@@ -177,17 +170,15 @@ router.get('/progress', authMiddleware, async (req, res) => {
       });
     }
     
-    // 计算本周收益条数
+    // 计算本周收益条数（使用countDocuments避免全量拉取）
     const weekRange = getWeekRange(currentWeek);
-    const goldLogs = await GoldLog.find({
+    const currentCount = await GoldLog.countDocuments({
       userId: userGold.userId,
       createTime: {
         $gte: weekRange.start,
         $lt: weekRange.end
       }
     });
-    
-    const currentCount = goldLogs.length;
     const progress = weeklyTarget.targetCount > 0 ? Math.min(Math.round((currentCount / weeklyTarget.targetCount) * 100), 100) : 0;
     
     // 检查是否已领取

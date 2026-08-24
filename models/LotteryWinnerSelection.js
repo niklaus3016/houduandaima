@@ -6,14 +6,17 @@ const lotteryWinnerSelectionSchema = new mongoose.Schema({
     required: true,
     unique: true
   },
-  firstPrizeUserId: {
-    type: String
+  firstPrizeUserIds: {
+    type: [String],
+    default: []
   },
-  secondPrizeUserId: {
-    type: String
+  secondPrizeUserIds: {
+    type: [String],
+    default: []
   },
-  thirdPrizeUserId: {
-    type: String
+  thirdPrizeUserIds: {
+    type: [String],
+    default: []
   },
   createdAt: {
     type: Date,

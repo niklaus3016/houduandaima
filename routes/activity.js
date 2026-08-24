@@ -13,15 +13,10 @@ function getClientIP(req) {
          '127.0.0.1';
 }
 
-// 记录用户活动（IP和设备信息）
 router.post('/record', async (req, res) => {
   try {
     const { userId, employeeId, deviceId } = req.body;
     
-    // 自动从请求中获取IP
-    const ip = getClientIP(req);
-    
-    // 参数校验
     if (!userId || !employeeId || !deviceId) {
       return res.status(400).json({ 
         success: false, 
@@ -29,22 +24,24 @@ router.post('/record', async (req, res) => {
       });
     }
     
-    // 使用findOneAndUpdate实现upsert（存在则更新，不存在则创建）
+    // CSJ 系统：登录接口(/api/employee/check)已记录设备信息，此处直接跳过避免重复
+    if (deviceId.startsWith('csj_')) {
+      return res.json({
+        success: true,
+        message: '活动记录成功',
+        data: { userId, employeeId, ip: getClientIP(req), deviceId, createTime: new Date() }
+      });
+    }
+    
+    // 百度系统：保持原逻辑
+    const ip = getClientIP(req);
     const result = await UserActivity.findOneAndUpdate(
       { userId, ip, deviceId },
       {
-        $set: {
-          employeeId,
-          updateTime: new Date()
-        },
-        $setOnInsert: {
-          createTime: new Date()
-        }
+        $set: { employeeId, updateTime: new Date() },
+        $setOnInsert: { createTime: new Date() }
       },
-      {
-        upsert: true,
-        new: true
-      }
+      { upsert: true, new: true }
     );
     
     res.json({

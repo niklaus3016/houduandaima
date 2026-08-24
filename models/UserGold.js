@@ -28,4 +28,8 @@ const userGoldSchema = new mongoose.Schema({
   }
 });
 
+// 添加索引优化查询性能
+userGoldSchema.index({ employeeId: 1 });
+userGoldSchema.index({ userId: 1, employeeId: 1 });
+
 module.exports = mongoose.model('UserGold', userGoldSchema);

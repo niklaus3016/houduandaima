@@ -353,7 +353,9 @@ router.post('/:id/approve', authMiddleware, async (req, res) => {
       const admin = await Admin.findOne({ username: record.userId });
       if (admin) {
         try {
-          clear(`team_leader_commission_v2_${admin._id}_${admin._id}`);
+          // ✅ 修复：key 必须与 dashboard.js L2474 的 `team_leader_commission_${_id}` 完全一致
+          // 旧代码误写成 `team_leader_commission_v2_${adminId}_${adminId}`，导致缓存清不掉
+          clear(`team_leader_commission_${admin._id}`);
           clear(`group-leader-commission-stats-v2-${admin._id}`);
           clear(`super_dividend_summary_admin_`);
         } catch (e) {
@@ -394,7 +396,9 @@ router.post('/:id/reject', authMiddleware, async (req, res) => {
         );
         // 清理管理员相关的缓存（与 submit 保持一致）
         try {
-          clear(`team_leader_commission_v2_${admin._id}_${admin._id}`);
+          // ✅ 修复：key 必须与 dashboard.js L2474 的 `team_leader_commission_${_id}` 完全一致
+          // 旧代码误写成 `team_leader_commission_v2_${admin._id}_${admin._id}`，导致缓存清不掉
+          clear(`team_leader_commission_${admin._id}`);
           clear(`group-leader-commission-stats-v2-${admin._id}`);
           clear(`super_dividend_summary_admin_`);
         } catch (e) {
@@ -520,11 +524,13 @@ router.post('/admin/submit', authMiddleware, async (req, res) => {
       availableBalance = Math.max(0, (+admin.commission || 0) - currentMonthWithdrawn);
     }
 
-    // 检查余额是否充足
-    if (amount > availableBalance) {
-      return res.status(400).json({ 
-        success: false, 
-        message: `余额不足，可提现金额: ${availableBalance.toFixed(2)}` 
+    // 检查余额是否充足（修复浮点精度：先四舍五入到2位再比较，
+    // 避免 availableBalance=1099.9099999 时提交 1099.91 误判余额不足）
+    const availableBalanceRounded = +availableBalance.toFixed(2);
+    if (amount > availableBalanceRounded) {
+      return res.status(400).json({
+        success: false,
+        message: `余额不足，可提现金额: ${availableBalanceRounded.toFixed(2)}`
       });
     }
     
@@ -549,7 +555,9 @@ router.post('/admin/submit', authMiddleware, async (req, res) => {
     // Admin.commission 字段现在专门用于存储分成比例，不再用于可提现余额
     
     try {
-      clear(`team_leader_commission_v2_${adminId}_${adminId}`);
+      // ✅ 修复：key 必须与 dashboard.js L2474 的 `team_leader_commission_${_id}` 完全一致
+      // 旧代码误写成 `team_leader_commission_v2_${adminId}_${adminId}`，导致缓存清不掉
+      clear(`team_leader_commission_${adminId}`);
       clear(`group-leader-commission-stats-v2-${adminId}`);
       clear(`super_dividend_summary_admin_`);
     } catch (e) {

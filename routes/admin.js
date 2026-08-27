@@ -64,6 +64,12 @@ router.post('/login', async (req, res) => {
         }
       }
     });
+
+    // 🔴 登录后自动同步 TL 提成率（异步，不阻塞响应）
+    if (admin.role === 'NORMAL_ADMIN') {
+      const { syncTLCommission } = require('../utils/tlCommissionSync');
+      syncTLCommission(admin._id.toString()).catch(() => {});
+    }
   } catch (error) {
     console.error('登录错误:', error);
     res.status(500).json({ success: false, message: '服务器错误' });

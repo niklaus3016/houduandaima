@@ -22,8 +22,8 @@ const DASHBOARD_CACHE_TTL = {
   groups: CACHE_TTL.groups || 60 * 60 * 1000
 };
 
-function getCacheKey(range, team) {
-  return `kpi_${range}_${team || 'all'}`;
+function getCacheKey(range, team, userId) {
+  return `kpi_${userId || 'all'}_${range}_${team || 'all'}`;
 }
 
 function getFromCache(key) {
@@ -64,7 +64,7 @@ router.get('/kpi', authMiddleware, async (req, res) => {
     const { team, group } = req.query;
     
     // 检查缓存
-    const cacheKey = getCacheKey(range, team || group);
+    const cacheKey = getCacheKey(range, team || group, req.user?.id);
     const cachedData = getFromCache(cacheKey);
     if (cachedData) {
       return res.json({ success: true, data: cachedData, cached: true });
@@ -140,12 +140,12 @@ router.get('/kpi', authMiddleware, async (req, res) => {
           commissionRate = 0.05;
         } else if (currentAdmin.teamName && 
                   (currentAdmin.role === 'NORMAL_ADMIN' || currentAdmin.role === 'normal_admin')) {
-          // 团队长：包含直推员工 + 下属所有组的员工
+          // 团队长：≤2级规则
           // 1. 直推员工（parentId 匹配）
           const directEmployees = await Employee.find({ parentId: currentAdmin._id.toString() });
           
-          // 2. 下属组的员工（通过 teamLeaderId 找到所有组，再找组内员工）
-          const adminGroups = await TeamGroup.find({ teamLeaderId: currentAdmin._id }).lean();
+          // 2. 下属组的员工（通过 teamLeaderId 找到所有 active 组，再找组内员工。G1：status='disbanded' 解散组不再计入，避免晋升时老组残留 groupName 把员工串回老 TL）
+          const adminGroups = await TeamGroup.find({ teamLeaderId: currentAdmin._id, status: { $ne: 'disbanded' } }).lean();
           const groupNames = adminGroups.map(g => g.groupName).filter(Boolean);
           const groupIds = adminGroups.map(g => String(g._id));
           
@@ -159,10 +159,30 @@ router.get('/kpi', authMiddleware, async (req, res) => {
             });
           }
           
-          // 合并去重
+          // 3. 下属TL直属员工（≤2级：排除下属TL自己的组长组员工！）
+          let subTlDirectEmployees = [];
+          const subTls = await Admin.find({
+            parentTlId: currentAdmin._id,
+            role: { $in: ['NORMAL_ADMIN', 'normal_admin'] }
+          }).select('_id').lean();
+          for (const stl of subTls) {
+            const stlId = String(stl._id);
+            const stlAll = await Employee.find({ parentId: stlId }).select('employeeId groupName teamGroupId').lean();
+            const stlGroups = await TeamGroup.find({ teamLeaderId: stl._id, status: { $ne: 'disbanded' } }).lean();
+            const sgids = new Set(stlGroups.map(g => String(g._id)));
+            const sgnms = new Set(stlGroups.map(g => g.groupName).filter(Boolean));
+            stlAll.forEach(e => {
+              const gid = e.teamGroupId ? String(e.teamGroupId) : '';
+              const gn = e.groupName || '';
+              if (!sgids.has(gid) && !sgnms.has(gn)) subTlDirectEmployees.push(e);
+            });
+          }
+          
+          // 合并去重（≤2级员工）
           const allEmployeesMap = new Map();
           directEmployees.forEach(e => allEmployeesMap.set(String(e.employeeId), e));
           groupEmployees.forEach(e => allEmployeesMap.set(String(e.employeeId), e));
+          subTlDirectEmployees.forEach(e => allEmployeesMap.set(String(e.employeeId), e));
           const employees = Array.from(allEmployeesMap.values());
           
           employeeIds = employees.map(e => e.employeeId);
@@ -177,6 +197,7 @@ router.get('/kpi', authMiddleware, async (req, res) => {
           req._teamLeaderAdminId = currentAdmin._id;
           req._teamLeaderDirectEmpIds = directEmployees.map(e => e.employeeId);
           req._teamLeaderGroupEmpIds = groupEmployees.map(e => e.employeeId);
+          req._teamLeaderSubTlDirectEmpIds = subTlDirectEmployees.map(e => e.employeeId);
           req._teamLeaderCommission = commissionRate;
         }
       }
@@ -315,7 +336,8 @@ router.get('/kpi', authMiddleware, async (req, res) => {
             _id: null,
             count: { $sum: 1 },
             totalGold: { $sum: '$gold' },
-            totalEcpm: { $sum: '$ecpm' }
+            totalEcpm: { $sum: '$ecpm' },
+            filteredGold: { $sum: { $cond: [{ $lte: ['$gold', 2000] }, '$gold', 0] } }
           }
         }
       ]),
@@ -326,14 +348,15 @@ router.get('/kpi', authMiddleware, async (req, res) => {
             _id: null,
             count: { $sum: 1 },
             totalGold: { $sum: '$gold' },
-            totalEcpm: { $sum: '$ecpm' }
+            totalEcpm: { $sum: '$ecpm' },
+            filteredGold: { $sum: { $cond: [{ $lte: ['$gold', 2000] }, '$gold', 0] } }
           }
         }
       ])
     ]);
     
-    const current = currentStats[0] || { count: 0, totalGold: 0, totalEcpm: 0 };
-    const prev = prevStats[0] || { count: 0, totalGold: 0, totalEcpm: 0 };
+    const current = currentStats[0] || { count: 0, totalGold: 0, totalEcpm: 0, filteredGold: 0 };
+    const prev = prevStats[0] || { count: 0, totalGold: 0, totalEcpm: 0, filteredGold: 0 };
     
     let totalImpressions = current.count;
     let totalClicks = Math.floor(totalImpressions * 0.15);
@@ -393,10 +416,12 @@ router.get('/kpi', authMiddleware, async (req, res) => {
       : 0;
     
     // 计算总业绩和总提成（基于金币口径）
-    const totalPerformance = totalGold / 1000; // 用户收益
-    const totalCommissionAmount = totalPerformance * commissionRate; // 组长提成
-    const prevPerformance = prevTotalGold / 1000;
-    const prevCommissionAmount = prevPerformance * commissionRate;
+    const totalPerformance = totalGold / 1000; // 用户收益（展示用，不过滤）
+    const totalCommissionBase = (current.filteredGold || 0) / 1000; // 提成基数（过滤 gold>2000）
+    const totalCommissionAmount = totalCommissionBase * commissionRate; // 组长提成
+    const prevPerformance = prevTotalGold / 1000; // 展示用，不过滤
+    const prevCommissionBase = (prev.filteredGold || 0) / 1000; // 提成基数（过滤）
+    const prevCommissionAmount = prevCommissionBase * commissionRate;
     
     // 总业绩环比（基于金币口径）
     const totalPerformanceGrowth = prevPerformance > 0 
@@ -436,114 +461,89 @@ router.get('/kpi', authMiddleware, async (req, res) => {
     };
     
     // === 团队长角色：补充直推/间推拆分数据 ===
+    // 直接复用 computeNewKpi（与 /team-leader 同口径，含≤2级限制），避免两处逻辑不一致
     if (req._isTeamLeaderRole) {
-      const mongoose = require('mongoose');
-      const EmployeeModel = mongoose.model('Employee');
-      const UserGoldModel = mongoose.model('UserGold');
-      const GoldLogModel = mongoose.model('GoldLog');
+      const tlScope = { kind: 'TL', adminId: String(req._teamLeaderAdminId) };
+      const tlKpi = await computeNewKpi(tlScope, range);
       
-      const tlCommission = req._teamLeaderCommission;
-      const glOwnRate = 0.05;
+      // 补充在册口径（TL自己的直推员工、组长组员工、子TL直属员工<=2级）
       const directEmpIds = req._teamLeaderDirectEmpIds || [];
       const groupEmpIds = req._teamLeaderGroupEmpIds || [];
+      const mongoose = require('mongoose');
+      const EmployeeModel = mongoose.model('Employee');
+      const LoginRecord = mongoose.model('LoginRecord');
+      const AdminModel = mongoose.model('Admin');
+      const TeamGroup = mongoose.model('TeamGroup');
       
-      // 直推员工→用户
-      const directUgs = await UserGoldModel.find({ employeeId: { $in: directEmpIds } }).select('userId').lean();
-      const directUserIds = directUgs.map(u => u.userId);
-      // 间推员工→用户
-      const indirectUgs = await UserGoldModel.find({ employeeId: { $in: groupEmpIds } }).select('userId').lean();
-      const indirectUserIds = indirectUgs.map(u => u.userId);
-      
-      // === 直推/间推 统计函数 ===
-      async function calcSplit(userIds, empIds, isDirect) {
-        const curLogs = await GoldLogModel.find({
-          userId: { $in: userIds }, createTime: { $gte: startDate, $lt: endDate }
-        }).select('gold commissionRate tlCommissionRate parentTlCommissionRate').lean();
-        const prevLogs = await GoldLogModel.find({
-          userId: { $in: userIds }, createTime: { $gte: prevStartDate, $lt: prevEndDate }
-        }).select('gold commissionRate tlCommissionRate parentTlCommissionRate').lean();
-        
-        let curGold = 0, curImpressions = curLogs.length;
-        let prevGold = 0, prevImpressions = prevLogs.length;
-        let curCommGold = 0, prevCommGold = 0;
-        
-        // dRateExprRate（直推提成率）
-        function dRateExprRate(l, fallback) {
-          const hasTl = typeof l.tlCommissionRate === 'number' && l.tlCommissionRate > 0 && l.tlCommissionRate <= 1;
-          const hasGl = typeof l.commissionRate === 'number' && l.commissionRate > 0 && l.commissionRate <= 1;
-          return hasTl ? l.tlCommissionRate : (hasGl ? l.commissionRate : fallback);
-        }
-        // ptlRateExprForSub（间推级差提成率）
-        function ptlRateExprForSub(l, subOwnRate, fallback) {
-          const hasPtl = typeof l.parentTlCommissionRate === 'number' && l.parentTlCommissionRate > 0 && l.parentTlCommissionRate <= 1;
-          const hasTl = typeof l.tlCommissionRate === 'number' && l.tlCommissionRate > 0 && l.tlCommissionRate <= 1;
-          const hasGl = typeof l.commissionRate === 'number' && l.commissionRate > 0 && l.commissionRate <= 1;
-          if (hasPtl) return l.parentTlCommissionRate;
-          let inferred = 0;
-          if (hasTl) inferred = Math.max(0, l.tlCommissionRate - subOwnRate);
-          else if (hasGl) inferred = Math.max(0, l.commissionRate - subOwnRate);
-          if (inferred === 0) inferred = Math.max(0, fallback);
-          return inferred;
-        }
-        
-        for (const l of curLogs) {
-          const g = +l.gold || 0;
-          curGold += g;
-          if (isDirect) {
-            curCommGold += g * dRateExprRate(l, tlCommission);
-          } else {
-            const subOwnRate = glOwnRate;
-            curCommGold += g * ptlRateExprForSub(l, subOwnRate, Math.max(0, tlCommission - subOwnRate));
-          }
-        }
-        for (const l of prevLogs) {
-          const g = +l.gold || 0;
-          prevGold += g;
-          if (isDirect) {
-            prevCommGold += g * dRateExprRate(l, tlCommission);
-          } else {
-            const subOwnRate = glOwnRate;
-            prevCommGold += g * ptlRateExprForSub(l, subOwnRate, Math.max(0, tlCommission - subOwnRate));
-          }
-        }
-        
-        const revenue = +(curGold / 1000).toFixed(2);
-        const prevRevenue = +(prevGold / 1000).toFixed(2);
-        const revenueGrowth = prevRevenue > 0 ? +(((revenue - prevRevenue) / prevRevenue) * 100).toFixed(1) : 0;
-        
-        const commission = +(curCommGold / 1000).toFixed(2);
-        const prevCommission = +(prevCommGold / 1000).toFixed(2);
-        const commissionGrowth = prevCommission > 0 ? +(((commission - prevCommission) / prevCommission) * 100).toFixed(1) : 0;
-        
-        const impressionsGrowth = prevImpressions > 0 ? +(((curImpressions - prevImpressions) / prevImpressions) * 100).toFixed(1) : 0;
-        
-        // 活跃用户（按金币记录）
-        const matchCur = { userId: { $in: userIds }, createTime: { $gte: startDate, $lt: endDate } };
-        const matchPrev = { userId: { $in: userIds }, createTime: { $gte: prevStartDate, $lt: prevEndDate } };
-        const curActive = await GoldLogModel.distinct('userId', matchCur);
-        const prevActive = await GoldLogModel.distinct('userId', matchPrev);
-        const activeUserCount = curActive.length;
-        const activeUsersGrowth = prevActive.length > 0 ? +(((activeUserCount - prevActive.length) / prevActive.length) * 100).toFixed(1) : 0;
-        // 在册用员工数口径（与 KPI 汇总 registeredUsers 保持一致）
-        const registeredUsers = empIds.length;
-        const activeRate = registeredUsers > 0 ? +((activeUserCount / registeredUsers * 100).toFixed(1)) : 0;
-        
-        return {
-          revenue,
-          revenueGrowth,
-          commission,
-          commissionGrowth,
-          impressions: curImpressions,
-          impressionsGrowth,
-          registeredUsers,
-          activeUserCount,
-          activeRate,
-          activeUsersGrowth
-        };
+      const subTls = await AdminModel.find({
+        parentTlId: req._teamLeaderAdminId,
+        role: { $in: ['NORMAL_ADMIN', 'normal_admin'] }
+      }).select('_id').lean();
+      let subTlDirectEmpIds = [];
+      for (const stl of subTls) {
+        const stlId = String(stl._id);
+        const stlAll = await EmployeeModel.find({ parentId: stlId }).select('employeeId groupName teamGroupId').lean();
+        const stlGroups = await TeamGroup.find({ teamLeaderId: stl._id, status: { $ne: 'disbanded' } }).lean();
+        const sgids = new Set(stlGroups.map(g => String(g._id)));
+        const sgnms = new Set(stlGroups.map(g => g.groupName).filter(Boolean));
+        stlAll.forEach(e => {
+          const gid = e.teamGroupId ? String(e.teamGroupId) : '';
+          const gn = e.groupName || '';
+          if (!sgids.has(gid) && !sgnms.has(gn)) subTlDirectEmpIds.push(String(e.employeeId));
+        });
       }
+      const indirectEmpIds = [...new Set([...groupEmpIds, ...subTlDirectEmpIds])];
       
-      const directSplit = await calcSplit(directUserIds, directEmpIds, true);
-      const indirectSplit = await calcSplit(indirectUserIds, groupEmpIds, false);
+      // 活跃用户（按在册范围）
+      const [dLRs, iLRs, dPLRs, iPLRs] = await Promise.all([
+        LoginRecord.find({ loginDate: { $gte: startDate, $lt: endDate }, employeeId: { $in: directEmpIds } }).select('employeeId').lean(),
+        LoginRecord.find({ loginDate: { $gte: startDate, $lt: endDate }, employeeId: { $in: indirectEmpIds } }).select('employeeId').lean(),
+        LoginRecord.find({ loginDate: { $gte: prevStartDate, $lt: prevEndDate }, employeeId: { $in: directEmpIds } }).select('employeeId').lean(),
+        LoginRecord.find({ loginDate: { $gte: prevStartDate, $lt: prevEndDate }, employeeId: { $in: indirectEmpIds } }).select('employeeId').lean()
+      ]);
+      const dActive = new Set(dLRs.map(r => r.employeeId)).size;
+      const iActive = new Set(iLRs.map(r => r.employeeId)).size;
+      const dPActive = new Set(dPLRs.map(r => r.employeeId)).size;
+      const iPActive = new Set(iPLRs.map(r => r.employeeId)).size;
+      
+      const dRegistered = directEmpIds.length;
+      const iRegistered = indirectEmpIds.length;
+      
+      function calcGrowth(cur, prev) { return prev > 0 ? +(((cur - prev) / prev) * 100).toFixed(1) : 0; }
+      
+      const directSplit = {
+        revenue: tlKpi.directRevenue,
+        prevRevenue: tlKpi.directPrevRevenue,
+        revenueGrowth: tlKpi.directRevenueGrowth,
+        commission: tlKpi.directCommission,
+        prevCommission: tlKpi.directPrevCommission,
+        commissionGrowth: tlKpi.directCommissionGrowth,
+        impressions: tlKpi.directImpressions,
+        prevImpressions: tlKpi.directPrevImpressions,
+        impressionsGrowth: calcGrowth(tlKpi.directImpressions, tlKpi.directPrevImpressions),
+        registeredUsers: dRegistered,
+        activeUserCount: dActive,
+        prevActive: dPActive,
+        activeRate: dRegistered > 0 ? +((dActive / dRegistered * 100).toFixed(1)) : 0,
+        activeUsersGrowth: calcGrowth(dActive, dPActive),
+      };
+      
+      const indirectSplit = {
+        revenue: tlKpi.indirectRevenue,
+        prevRevenue: tlKpi.indirectPrevRevenue,
+        revenueGrowth: tlKpi.indirectRevenueGrowth,
+        commission: tlKpi.indirectCommission,
+        prevCommission: tlKpi.indirectPrevCommission,
+        commissionGrowth: tlKpi.indirectCommissionGrowth,
+        impressions: tlKpi.indirectImpressions,
+        prevImpressions: tlKpi.indirectPrevImpressions,
+        impressionsGrowth: calcGrowth(tlKpi.indirectImpressions, tlKpi.indirectPrevImpressions),
+        registeredUsers: iRegistered,
+        activeUserCount: iActive,
+        prevActive: iPActive,
+        activeRate: iRegistered > 0 ? +((iActive / iRegistered * 100).toFixed(1)) : 0,
+        activeUsersGrowth: calcGrowth(iActive, iPActive),
+      };
       
       // 附加到返回数据
       resultData.directRevenue = directSplit.revenue;
@@ -579,6 +579,25 @@ router.get('/kpi', authMiddleware, async (req, res) => {
         ? +((splitTotalActive / splitTotalRegistered * 100).toFixed(1))
         : 0;
       
+      // TL 角色：汇总环比用拆分后的 prev 数据重算
+      const splitPrevRevenue = directSplit.prevRevenue + indirectSplit.prevRevenue;
+      const splitPrevCommission = directSplit.prevCommission + indirectSplit.prevCommission;
+      const splitPrevImpressions = directSplit.prevImpressions + indirectSplit.prevImpressions;
+      const splitPrevActive = directSplit.prevActive + indirectSplit.prevActive;
+      
+      const splitTotalPerformanceGrowth = splitPrevRevenue > 0
+        ? +(((splitTotalRevenue - splitPrevRevenue) / splitPrevRevenue) * 100).toFixed(1)
+        : 0;
+      const splitTotalCommissionGrowth = splitPrevCommission > 0
+        ? +(((splitTotalCommission - splitPrevCommission) / splitPrevCommission) * 100).toFixed(1)
+        : 0;
+      const splitTotalImpressionsGrowth = splitPrevImpressions > 0
+        ? +(((splitTotalImpressions - splitPrevImpressions) / splitPrevImpressions) * 100).toFixed(1)
+        : 0;
+      const splitTotalActiveUsersGrowth = splitPrevActive > 0
+        ? +(((splitTotalActive - splitPrevActive) / splitPrevActive) * 100).toFixed(1)
+        : 0;
+      
       resultData.revenue = splitTotalRevenue;
       resultData.totalPerformance = splitTotalRevenue;
       resultData.coins = splitTotalCoins;
@@ -588,6 +607,11 @@ router.get('/kpi', authMiddleware, async (req, res) => {
       resultData.activeUsers = splitTotalActive;
       resultData.activeUserCount = splitTotalActive;
       resultData.activeRate = splitTotalActiveRate;
+      // 覆盖汇总结论的环比（对齐拆分口径）
+      resultData.totalPerformanceGrowth = splitTotalPerformanceGrowth;
+      resultData.totalCommissionGrowth = splitTotalCommissionGrowth;
+      resultData.impressionsGrowth = splitTotalImpressionsGrowth;
+      resultData.activeUsersGrowth = splitTotalActiveUsersGrowth;
     }
     
     // 设置缓存
@@ -640,7 +664,12 @@ router.get('/users', authMiddleware, async (req, res) => {
       firstDayOfMonthBeijing.setUTCDate(1);
       firstDayOfMonthBeijing.setUTCHours(0, 0, 0, 0);
       startDate = new Date(firstDayOfMonthBeijing.getTime() - 8 * 60 * 60 * 1000);
-      endDate = new Date();
+      // 使用下月1号00:00作为结束时间，与KPI接口时间口径保持一致
+      const firstDayNextMonthBeijing = new Date(beijingNow);
+      firstDayNextMonthBeijing.setUTCDate(1);
+      firstDayNextMonthBeijing.setUTCMonth(firstDayNextMonthBeijing.getUTCMonth() + 1);
+      firstDayNextMonthBeijing.setUTCHours(0, 0, 0, 0);
+      endDate = new Date(firstDayNextMonthBeijing.getTime() - 8 * 60 * 60 * 1000);
     } else {
       const todayStartBeijing = new Date(beijingNow);
       todayStartBeijing.setUTCHours(0, 0, 0, 0);
@@ -648,41 +677,163 @@ router.get('/users', authMiddleware, async (req, res) => {
       endDate = new Date();
     }
     
-    // 使用聚合管道优化查询，避免加载所有记录到内存
-    const MAX_RECORDS = 5000; // 限制最多处理5000条记录
-    const goldLogsAggregation = await GoldLog.aggregate([
-      { $match: { createTime: { $gte: startDate, $lt: endDate } } },
-      { $group: {
-        _id: { employeeId: '$employeeId', userId: '$userId' },
-        watched: { $sum: 1 },
-        earnings: { $sum: '$gold' },
-        totalEcpm: { $sum: { $ifNull: ['$ecpm', 0] } }
-      }},
-      { $limit: MAX_RECORDS }
-    ]);
+    // ========== F2 优化：前置"在册员工范围"计算 ==========
+    // 1. 先按 team/group/role 算 validEmployeeIds（与原 filteredUserStats 过滤规则完全一致，只是前移）
+    // 2. 以此为基准生成 userStatsArray：保证"在册员工"全部显示（0 金币员工不再漏掉）
+    // 3. GoldLog 聚合前置 employeeId:{$in:validEmployeeIds} + hint，杜绝全表拖日志
+    let validEmployeeIds = [];
+    let scopeAdminForFilter = null;
+    const adminGroupCache = {};
+    let currentAdmin = null;
 
-    // 提取有金币记录的员工ID
-    const employeeIdsWithGold = [...new Set(goldLogsAggregation.map(log => log._id.employeeId))];
+    if (team) {
+      if (req.user && req.user.id) {
+        const me = await Admin.findById(req.user.id).lean();
+        if (me && me.teamName === team) scopeAdminForFilter = me;
+      }
+      if (!scopeAdminForFilter) {
+        scopeAdminForFilter = await Admin.findOne({ teamName: team, role: { $in: ['NORMAL_ADMIN', 'normal_admin'] } }).lean();
+      }
+      if (scopeAdminForFilter) {
+        const empIdSet = new Set();
+        const directEmps = await Employee.find({ parentId: scopeAdminForFilter._id.toString() }).lean();
+        directEmps.forEach(e => empIdSet.add(String(e.employeeId)));
+        if (scopeAdminForFilter.role && String(scopeAdminForFilter.role).toUpperCase() === 'NORMAL_ADMIN') {
+          const tlGroups = await TeamGroup.find({ teamLeaderId: scopeAdminForFilter._id, status: { $ne: 'disbanded' } }).lean();
+          const tlGroupNames = tlGroups.map(g => g.groupName).filter(Boolean);
+          const tlGroupIds = tlGroups.map(g => g._id.toString());
+          if (tlGroupNames.length || tlGroupIds.length) {
+            const allowedGroupIds = new Set(tlGroupIds);
+            const allowedGroupNames = new Set(tlGroupNames);
+            const groupEmpsRaw = await Employee.find({
+              $or: [
+                { groupName: { $in: tlGroupNames } },
+                { teamGroupId: { $in: tlGroupIds } }
+              ]
+            }).lean();
+            const groupEmps = router._f1_validateGroupEmps(groupEmpsRaw, { allowedGroupIds, allowedGroupNames });
+            groupEmps.forEach(e => empIdSet.add(String(e.employeeId)));
+          }
+        }
+        validEmployeeIds = [...empIdSet];
+      }
+    } else if (group) {
+      if (!adminGroupCache[group]) adminGroupCache[group] = await TeamGroup.findById(group);
+      const targetGroup = adminGroupCache[group];
+      if (targetGroup && targetGroup.groupName) {
+        const allowedGroupIds = new Set([String(targetGroup._id), String(group)]);
+        const allowedGroupNames = new Set([targetGroup.groupName]);
+        const employeesRaw = await Employee.find({
+          $or: [
+            { groupName: targetGroup.groupName },
+            { teamGroupId: group },
+            { teamGroupId: targetGroup._id.toString() }
+          ]
+        }).lean();
+        const employees = router._f1_validateGroupEmps(employeesRaw, { allowedGroupIds, allowedGroupNames });
+        validEmployeeIds = employees.map(e => String(e.employeeId));
+      }
+    } else if (req.user && (req.user.role === 'superadmin' || req.user.role === 'ADMIN_MANAGER' || req.user.role === 'admin_manager')) {
+      // 超管 / 高管：收集所有下属 TL（含子级 TL）名下的员工
+      currentAdmin = await Admin.findById(req.user.id);
+      if (currentAdmin) {
+        const managedIdStrings = (currentAdmin.managedTeamIds || []).map(id => String(id));
+        const empIdSet = new Set();
+        
+        if (req.user.role === 'superadmin') {
+          // 超管：全量员工
+          const allEmps = await Employee.find({}).select('employeeId').lean();
+          allEmps.forEach(e => empIdSet.add(String(e.employeeId)));
+        } else {
+          // 高管：递归收集所有下属 TL
+          const allTlIds = new Set(managedIdStrings);
+          const childTls = await Admin.find({ parentTlId: { $in: managedIdStrings } }).select('_id').lean();
+          childTls.forEach(t => allTlIds.add(String(t._id)));
+          
+          for (const tlId of allTlIds) {
+            const directEmps = await Employee.find({ parentId: tlId }).select('employeeId').lean();
+            directEmps.forEach(e => empIdSet.add(String(e.employeeId)));
+            
+            const tlGroups = await TeamGroup.find({ teamLeaderId: tlId, status: { $ne: 'disbanded' } }).lean();
+            const tlGroupNames = tlGroups.map(g => g.groupName).filter(Boolean);
+            const tlGroupIds = tlGroups.map(g => String(g._id));
+            if (tlGroupNames.length || tlGroupIds.length) {
+              const groupEmps = await Employee.find({
+                $or: [
+                  { groupName: { $in: tlGroupNames } },
+                  { teamGroupId: { $in: tlGroupIds } }
+                ]
+              }).select('employeeId').lean();
+              groupEmps.forEach(e => empIdSet.add(String(e.employeeId)));
+            }
+          }
+        }
+        validEmployeeIds = [...empIdSet];
+      }
+    } else if (req.user) {
+      currentAdmin = await Admin.findById(req.user.id);
+      if (currentAdmin) {
+        // G1 统一路径：直接查自己名下非解散组做 G 员工归属，不再依赖 Admin.teamGroupId
+        // (Admin.teamGroupId 可能指向已解散的历史组，导致命中 0 员工)
+        const directEmps = await Employee.find({ parentId: currentAdmin._id.toString() }).lean();
+        const tlGroups = await TeamGroup.find({ teamLeaderId: currentAdmin._id, status: { $ne: 'disbanded' } }).lean();
+        const tlGroupNames = tlGroups.map(g => g.groupName).filter(Boolean);
+        const tlGroupIds = tlGroups.map(g => g._id.toString());
+        let groupEmps = [];
+        if (tlGroupNames.length || tlGroupIds.length) {
+          const allowedGroupIds = new Set(tlGroupIds);
+          const allowedGroupNames = new Set(tlGroupNames);
+          const groupEmpsRaw = await Employee.find({
+            $or: [
+              { groupName: { $in: tlGroupNames } },
+              { teamGroupId: { $in: tlGroupIds } }
+            ]
+          }).lean();
+          groupEmps = router._f1_validateGroupEmps(groupEmpsRaw, { allowedGroupIds, allowedGroupNames });
+        }
+        const empIdSet = new Set();
+        directEmps.forEach(e => empIdSet.add(String(e.employeeId)));
+        groupEmps.forEach(e => empIdSet.add(String(e.employeeId)));
+        validEmployeeIds = [...empIdSet];
+      }
+    }
 
-    // 只查询有金币记录的员工
-    const relevantEmployees = employeeIdsWithGold.length > 0
-      ? await Employee.find({ employeeId: { $in: employeeIdsWithGold } })
+    // ========== 查 Employee 全集（在册=这里；0 金币员工通过 UserGold 映射生成 userId placeholder） ==========
+    const relevantEmployees = validEmployeeIds.length > 0
+      ? await Employee.find({ employeeId: { $in: validEmployeeIds } }).lean()
       : [];
     const employeeMap = {};
-    relevantEmployees.forEach(emp => {
-      employeeMap[emp.employeeId] = emp;
-    });
+    relevantEmployees.forEach(emp => { employeeMap[emp.employeeId] = emp; });
 
-    // 获取所有UserGold记录
-    const userGolds = await UserGold.find({
-      employeeId: { $in: Object.keys(employeeMap) }
-    });
+    // ========== 查 UserGold：给每个在册员工匹配全部 userId（一个员工可能多个 userId，修前就是按 userId 粒度输出） ==========
+    const userGolds = validEmployeeIds.length > 0
+      ? await UserGold.find({ employeeId: { $in: validEmployeeIds } }).lean()
+      : [];
     const userGoldMap = {};
+    const validUserIdsFromUG = new Set();     // 通过 UserGold 映射的"在册 userId 全集"（一个员工多 userId 会占多条）
+    const userIdToEmployeeId = {};            // userId -> employeeId
     userGolds.forEach(ug => {
       userGoldMap[ug.employeeId] = ug;
+      if (validEmployeeIds.includes(String(ug.employeeId))) {
+        validUserIdsFromUG.add(ug.userId);
+        userIdToEmployeeId[ug.userId] = String(ug.employeeId);
+      }
     });
 
-    // 构建用户统计数据
+    // ========== GoldLog 聚合：加 employeeId:{$in:validEmployeeIds} + hint，去掉无意义 $limit 5000 ==========
+    const goldLogsAggregation = validEmployeeIds.length > 0
+      ? await GoldLog.aggregate([
+          { $match: { employeeId: { $in: validEmployeeIds }, createTime: { $gte: startDate, $lt: endDate } } },
+          { $group: {
+            _id: { employeeId: '$employeeId', userId: '$userId' },
+            watched: { $sum: 1 },
+            earnings: { $sum: '$gold' },
+            totalEcpm: { $sum: { $ifNull: ['$ecpm', 0] } }
+          }}
+        ], { hint: { employeeId: 1, createTime: 1 } })
+      : [];
+
+    // 构建 userStats（原始 userId 粒度），对有金币记录的人保持原字节级不变
     const userStats = {};
     goldLogsAggregation.forEach(log => {
       const empId = log._id.employeeId;
@@ -696,9 +847,8 @@ router.get('/users', authMiddleware, async (req, res) => {
       };
     });
 
-    const allEmployeeIds = Object.keys(employeeMap);
-
     // 缓存管理员和团队信息，避免重复查询
+    const allEmployeeIds = Object.keys(employeeMap);
     const parentIds = [...new Set(relevantEmployees.map(e => e.parentId).filter(id => id))];
     const admins = parentIds.length > 0
       ? await Admin.find({ _id: { $in: parentIds } })
@@ -708,6 +858,7 @@ router.get('/users', authMiddleware, async (req, res) => {
       adminMap[admin._id.toString()] = admin;
     });
 
+    // T1（本优化项不做，单独放到后面 T1 任务一次性处理）：Team.find({}) 暂保留，避免一次改太多难回溯
     const teams = await Team.find({});
     const teamMap = {};
     teams.forEach(team => {
@@ -716,96 +867,22 @@ router.get('/users', authMiddleware, async (req, res) => {
       });
     });
 
-    // 预缓存管理员信息和组信息，避免重复查询
-    let currentAdmin = null;
-    let currentAdminGroup = null;
-    const adminGroupCache = {};
+    // ========== 生成 userId 全集 = 在册员工中每个有 userId 的人（0 金币员工从 UserGold 取 userId，可能一位员工多 userId，与修前一致） ==========
+    const finalUserIds = new Set();
+    // 1) 先塞所有有金币记录的 userId（修前 byte-equal 基础，按 userId 粒度）
+    Object.values(userStats).forEach(s => finalUserIds.add(s.userId));
+    // 2) 再塞 UserGold 映射出的"在册 userId"，补 0 金币员工（一个员工多 userId 会加多条）
+    validUserIdsFromUG.forEach(uid => finalUserIds.add(uid));
 
-    // 团队筛选
-    let filteredUserStats = userStats;
-    if (team) {
-      const targetTeam = teams.find(t => t.name === team);
-      if (targetTeam) {
-        const teamMemberUserIds = targetTeam.members.map(m => m.userId);
-        filteredUserStats = {};
-        Object.keys(userStats).forEach(userId => {
-          if (teamMemberUserIds.includes(userId)) {
-            filteredUserStats[userId] = userStats[userId];
-          }
-        });
-      }
-    } else if (group) {
-      // 使用 group 参数筛选（组长的 teamGroupId）
-      if (!adminGroupCache[group]) {
-        adminGroupCache[group] = await TeamGroup.findById(group);
-      }
-      const targetGroup = adminGroupCache[group];
-      if (targetGroup && targetGroup.groupName) {
-        // 使用 groupName 筛选，同时兼容 ObjectId 和 String
-        const employees = await Employee.find({
-          $or: [
-            { groupName: targetGroup.groupName },
-            { teamGroupId: group },
-            { teamGroupId: targetGroup._id.toString() }
-          ]
-        });
-        const employeeIds = employees.map(e => e.employeeId);
-        filteredUserStats = {};
-        Object.keys(userStats).forEach(userId => {
-          if (employeeIds.includes(userStats[userId].employeeId)) {
-            filteredUserStats[userId] = userStats[userId];
-          }
-        });
-      }
-    } else if (req.user && req.user.role !== 'superadmin') {
-      // 非超管，根据角色进行筛选
-      if (!currentAdmin) {
-        currentAdmin = await Admin.findById(req.user.id);
-      }
-      if (currentAdmin) {
-        if (currentAdmin.teamGroupId) {
-          // 组长：按groupName筛选（先获取组信息）
-          if (!adminGroupCache[currentAdmin.teamGroupId]) {
-            adminGroupCache[currentAdmin.teamGroupId] = await TeamGroup.findById(currentAdmin.teamGroupId);
-          }
-          const group = adminGroupCache[currentAdmin.teamGroupId];
-          if (group && group.groupName) {
-            // 使用 groupName 筛选，同时兼容 ObjectId 和 String
-            const employees = await Employee.find({
-              $or: [
-                { groupName: group.groupName },
-                { teamGroupId: currentAdmin.teamGroupId },
-                { teamGroupId: group._id.toString() }
-              ]
-            });
-            const employeeIds = employees.map(e => e.employeeId);
-            filteredUserStats = {};
-            Object.keys(userStats).forEach(userId => {
-              if (employeeIds.includes(userStats[userId].employeeId)) {
-                filteredUserStats[userId] = userStats[userId];
-              }
-            });
-          }
-        } else if (currentAdmin.teamName) {
-          // 团队长：按teamName筛选
-          const employees = await Employee.find({ parentId: currentAdmin._id.toString() });
-          const employeeIds = employees.map(e => e.employeeId);
-          filteredUserStats = {};
-          Object.keys(userStats).forEach(userId => {
-            if (employeeIds.includes(userStats[userId].employeeId)) {
-              filteredUserStats[userId] = userStats[userId];
-            }
-          });
-        }
-      }
-    }
-    
-    const userIds = Object.keys(filteredUserStats);
-    const activities = await UserActivity.find({
-      userId: { $in: userIds },
-      createTime: { $gte: startDate, $lt: endDate }
-    });
-    
+    // ========== UserActivity（ipCount / deviceCount）：按 userId 全集 ==========
+    const userIdsArr = [...finalUserIds];
+    const activities = userIdsArr.length > 0
+      ? await UserActivity.find({
+          userId: { $in: userIdsArr },
+          createTime: { $gte: startDate, $lt: endDate }
+        }).lean()
+      : [];
+
     const ipCountMap = {};
     const deviceCountMap = {};
     activities.forEach(act => {
@@ -814,27 +891,50 @@ router.get('/users', authMiddleware, async (req, res) => {
       if (act.ip) ipCountMap[act.userId].add(act.ip);
       if (act.deviceId) deviceCountMap[act.userId].add(act.deviceId);
     });
-    
-    const userStatsArray = Object.values(filteredUserStats).map(stat => {
+
+    // ========== 组装 userStatsArray（按 userId 粒度，与修前 byte-equal；在册全员都有 userId 就不会漏） ==========
+    const allSeen = new Set();
+    const rawRows = [];
+
+    // Step1: 有金币的 userId 先登记（修前的行为，byte-equal）
+    Object.values(userStats).forEach(stat => {
+      allSeen.add(stat.userId);
+      rawRows.push(stat);
+    });
+
+    // Step2: UserGold 中在册但 userStats 中没记录的 userId → 补 placeholder（0 金币员工/ 该员工另一 userId 本月无业绩）
+    validUserIdsFromUG.forEach(uid => {
+      if (!allSeen.has(uid)) {
+        allSeen.add(uid);
+        rawRows.push({
+          userId: uid,
+          employeeId: userIdToEmployeeId[uid],
+          watched: 0,
+          earnings: 0,
+          totalEcpm: 0
+        });
+      }
+    });
+
+    const userStatsArray = rawRows.map(stat => {
       const employee = employeeMap[stat.employeeId] || {};
-      const regDays = employee.createdAt 
+      const regDays = employee.createdAt
         ? Math.floor((Date.now() - new Date(employee.createdAt).getTime()) / (1000 * 60 * 60 * 24))
         : 0;
-      
+
       let superior = '系统直属';
       if (teamMap[stat.userId]) {
         superior = teamMap[stat.userId];
       } else if (employee.parentId) {
-        // 修复：优先显示真实姓名，其次显示战队名称
         const parentAdmin = adminMap[employee.parentId.toString()];
         if (parentAdmin) {
           superior = parentAdmin.realName || parentAdmin.teamName || parentAdmin.username;
         }
       }
-      
+
       const ipCount = ipCountMap[stat.userId] ? ipCountMap[stat.userId].size : 0;
       const deviceCount = deviceCountMap[stat.userId] ? deviceCountMap[stat.userId].size : 0;
-      
+
       return {
         ...stat,
         name: employee.realName || stat.userId,
@@ -914,7 +1014,7 @@ router.get('/team-leader', authMiddleware, async (req, res) => {
       }
       
       // 1. 获取KPI数据（带缓存）- 组长缓存key用teamGroupId
-      const kpiCacheKey = getCacheKey(range, currentAdmin.teamGroupId);
+      const kpiCacheKey = getCacheKey(range, currentAdmin.teamGroupId, currentAdmin._id.toString());
       let kpiData = getFromCache(kpiCacheKey);
       
       if (!kpiData) {
@@ -1183,7 +1283,7 @@ router.get('/team-leader', authMiddleware, async (req, res) => {
     // 超管可以查看所有数据
     if (currentAdmin.role === 'superadmin') {
       // 1. 获取KPI数据（带缓存）- 超管缓存key用'all'
-      const kpiCacheKey = getCacheKey(range, 'superadmin');
+      const kpiCacheKey = getCacheKey(range, 'superadmin', currentAdmin._id.toString());
       let kpiData = getFromCache(kpiCacheKey);
       
       if (!kpiData) {
@@ -1480,13 +1580,55 @@ router.get('/team-leader', authMiddleware, async (req, res) => {
     let teamsWithStats = [];
     
     // 1. 获取KPI数据（带缓存）
-    const kpiCacheKey = getCacheKey(range, currentAdmin.teamName);
+    const kpiCacheKey = getCacheKey(range, currentAdmin.teamName, currentAdmin._id.toString());
     // 暂时禁用缓存以便调试
     let kpiData = null; // getFromCache(kpiCacheKey);
     
     if (!kpiData) {
       const adminId = currentAdmin._id.toString ? currentAdmin._id.toString() : currentAdmin._id;
-      const employees = await Employee.find({ parentId: adminId });
+      
+      // TL业绩员工范围（≤2级，与提成computeNewKpi一致）：
+      // 1. TL直推员工(parentId = TL)
+      // 2. TL自己的组长组员工(TeamGroup.teamLeaderId=TL)
+      // 3. 每个下属TL的直属员工(parentId=子TL 且 NOT IN 子TL组长组)
+      const directEmployees = await Employee.find({ parentId: adminId });
+      const adminGroups = await TeamGroup.find({ teamLeaderId: currentAdmin._id, status: { $ne: 'disbanded' } }).lean();
+      const groupNames = adminGroups.map(g => g.groupName).filter(Boolean);
+      const groupIds = adminGroups.map(g => String(g._id));
+      let groupEmployees = [];
+      if (groupNames.length > 0 || groupIds.length > 0) {
+        const raw = await Employee.find({ $or: [{ groupName: { $in: groupNames } }, { teamGroupId: { $in: groupIds } }] }).select('employeeId teamGroupId groupName').lean();
+        const gids = new Set(groupIds); const gnms = new Set(groupNames);
+        groupEmployees = raw.filter(e => {
+          const gid = e.teamGroupId ? String(e.teamGroupId) : '';
+          const gn = e.groupName || '';
+          return gids.has(gid) || gnms.has(gn);
+        });
+      }
+      // 下属TL直属员工（排除下属TL自己的组长组员工 = 超2级）
+      let subTlDirectEmployees = [];
+      const subTls = await Admin.find({
+        parentTlId: currentAdmin._id,
+        role: { $in: ['NORMAL_ADMIN', 'normal_admin'] }
+      }).select('_id').lean();
+      for (const stl of subTls) {
+        const stlId = String(stl._id);
+        const stlAll = await Employee.find({ parentId: stlId }).select('employeeId groupName teamGroupId').lean();
+        const stlGroups = await TeamGroup.find({ teamLeaderId: stl._id, status: { $ne: 'disbanded' } }).lean();
+        const sgids = new Set(stlGroups.map(g => String(g._id)));
+        const sgnms = new Set(stlGroups.map(g => g.groupName).filter(Boolean));
+        stlAll.forEach(e => {
+          const gid = e.teamGroupId ? String(e.teamGroupId) : '';
+          const gn = e.groupName || '';
+          if (!sgids.has(gid) && !sgnms.has(gn)) subTlDirectEmployees.push(e);
+        });
+      }
+      // 合并去重（≤2级）
+      const empMap = new Map();
+      directEmployees.forEach(e => empMap.set(String(e.employeeId), e));
+      groupEmployees.forEach(e => empMap.set(String(e.employeeId), e));
+      subTlDirectEmployees.forEach(e => empMap.set(String(e.employeeId), e));
+      const employees = Array.from(empMap.values());
       const employeeIds = employees.map(e => e.employeeId);
       const teamMemberUserIds = employeeIds;
       
@@ -1571,25 +1713,37 @@ router.get('/team-leader', authMiddleware, async (req, res) => {
       const [currentStats, prevStats] = await Promise.all([
         GoldLog.aggregate([
           { $match: matchStage },
-          { $group: { _id: null, count: { $sum: 1 }, totalGold: { $sum: '$gold' }, totalEcpm: { $sum: '$ecpm' } } }
+          { $group: { 
+            _id: null, 
+            count: { $sum: 1 }, 
+            totalGold: { $sum: '$gold' }, 
+            totalEcpm: { $sum: '$ecpm' },
+            filteredGold: { $sum: { $cond: [{ $lte: [{ $ifNull: ['$gold', 0] }, 2000] }, { $ifNull: ['$gold', 0] }, 0] } }
+          } }
         ]),
         GoldLog.aggregate([
           { $match: prevMatchStage },
-          { $group: { _id: null, count: { $sum: 1 }, totalGold: { $sum: '$gold' }, totalEcpm: { $sum: '$ecpm' } } }
+          { $group: { 
+            _id: null, 
+            count: { $sum: 1 }, 
+            totalGold: { $sum: '$gold' }, 
+            totalEcpm: { $sum: '$ecpm' },
+            filteredGold: { $sum: { $cond: [{ $lte: [{ $ifNull: ['$gold', 0] }, 2000] }, { $ifNull: ['$gold', 0] }, 0] } }
+          } }
         ])
       ]);
       
-      const current = currentStats[0] || { count: 0, totalGold: 0, totalEcpm: 0 };
-      const prev = prevStats[0] || { count: 0, totalGold: 0, totalEcpm: 0 };
+      const current = currentStats[0] || { count: 0, totalGold: 0, totalEcpm: 0, filteredGold: 0 };
+      const prev = prevStats[0] || { count: 0, totalGold: 0, totalEcpm: 0, filteredGold: 0 };
       
       let totalImpressions = current.count;
       let totalClicks = Math.floor(totalImpressions * 0.15);
       let totalGold = current.totalGold;
-      let totalRevenue = current.totalGold / 1000;
+      let totalRevenue = current.totalGold / 1000; // 展示用，不过滤
       let totalEcpmValue = current.totalEcpm;
       
       let prevTotalGold = prev.totalGold;
-      let prevTotalRevenue = prev.totalGold / 1000;
+      let prevTotalRevenue = prev.totalGold / 1000; // 展示用，不过滤
       let prevTotalEcpmValue = prev.totalEcpm;
       
       const revenueGrowth = prevTotalRevenue > 0 ? ((totalRevenue - prevTotalRevenue) / prevTotalRevenue * 100).toFixed(1) : 0;
@@ -1748,21 +1902,35 @@ router.get('/team-leader', authMiddleware, async (req, res) => {
 
         const rangeStats = await GoldLog.aggregate([
           { $match: { employeeId: { $in: employeeIds }, createTime: { $gte: rangeStartUTC, $lt: rangeEndUTC } } },
-          { $group: { _id: null, count: { $sum: 1 }, totalGold: { $sum: '$gold' }, totalEcpm: { $sum: '$ecpm' } } }
+          { $group: { 
+            _id: null, 
+            count: { $sum: 1 }, 
+            totalGold: { $sum: '$gold' }, 
+            totalEcpm: { $sum: '$ecpm' },
+            filteredGold: { $sum: { $cond: [{ $lte: [{ $ifNull: ['$gold', 0] }, 2000] }, { $ifNull: ['$gold', 0] }, 0] } }
+          } }
         ]);
 
         const prevStats = await GoldLog.aggregate([
           { $match: { employeeId: { $in: employeeIds }, createTime: { $gte: prevStartUTC, $lt: prevEndUTC } } },
-          { $group: { _id: null, count: { $sum: 1 }, totalGold: { $sum: '$gold' }, totalEcpm: { $sum: '$ecpm' } } }
+          { $group: { 
+            _id: null, 
+            count: { $sum: 1 }, 
+            totalGold: { $sum: '$gold' }, 
+            totalEcpm: { $sum: '$ecpm' },
+            filteredGold: { $sum: { $cond: [{ $lte: [{ $ifNull: ['$gold', 0] }, 2000] }, { $ifNull: ['$gold', 0] }, 0] } }
+          } }
         ]);
 
-        const currentStats = rangeStats[0] || { count: 0, totalGold: 0, totalEcpm: 0 };
-        const prev = prevStats[0] || { count: 0, totalGold: 0, totalEcpm: 0 };
+        const currentStats = rangeStats[0] || { count: 0, totalGold: 0, totalEcpm: 0, filteredGold: 0 };
+        const prev = prevStats[0] || { count: 0, totalGold: 0, totalEcpm: 0, filteredGold: 0 };
 
-        const rangeGoldRevenue = currentStats.totalGold / 1000;
-        const prevGoldRevenue = prev.totalGold / 1000;
-        const rangeCommission = rangeGoldRevenue * (group.commission || 0.05);
-        const prevCommission = prevGoldRevenue * (group.commission || 0.05);
+        const rangeGoldRevenue = currentStats.totalGold / 1000; // 展示用，不过滤
+        const prevGoldRevenue = prev.totalGold / 1000; // 展示用，不过滤
+        const rangeCommissionBase = (currentStats.filteredGold || 0) / 1000; // 提成基数，过滤 gold>2000
+        const prevCommissionBase = (prev.filteredGold || 0) / 1000; // 提成基数，过滤
+        const rangeCommission = rangeCommissionBase * (group.commission || 0.05);
+        const prevCommission = prevCommissionBase * (group.commission || 0.05);
         const avgEcpm = currentStats.count > 0 ? (currentStats.totalGold / currentStats.count) : 0;
 
         return {
@@ -1790,7 +1958,11 @@ router.get('/team-leader', authMiddleware, async (req, res) => {
     }
 
     const totalGroupCommission = groupsWithStats.reduce((sum, g) => sum + (g.todayRevenue || 0), 0);
-    const teamLeadCommission = Math.max(0, kpiData.revenue * 0.2 - totalGroupCommission);
+    
+    // 使用 computeNewKpi 计算正确的 TL 提成（通过级差方式）
+    const tlScope = { kind: 'TL', adminId: String(currentAdmin._id) };
+    const tlKpi = await computeNewKpi(tlScope, range);
+    const teamLeadCommission = tlKpi.teamCommission || 0;
 
     kpiData.teamLeadCommission = parseFloat(teamLeadCommission.toFixed(2));
     kpiData.groupLeadersCommission = parseFloat(totalGroupCommission.toFixed(2));
@@ -1868,7 +2040,7 @@ router.get('/team-leader/teams', authMiddleware, async (req, res) => {
 
     const [employees, groups] = await Promise.all([
       Employee.find({ parentId: adminId }),
-      TeamGroup.find({ teamLeaderId: adminId })
+      TeamGroup.find({ teamLeaderId: adminId, status: { $ne: 'disbanded' } })
     ]);
 
     const employeeIds = employees.map(e => e.employeeId);
@@ -2084,8 +2256,47 @@ router.get('/team-leader/revenue', authMiddleware, async (req, res) => {
       return res.json({ success: true, data: cachedData, cached: true });
     }
 
-    // 获取团队长下的所有员工
-    const employees = await Employee.find({ parentId: currentAdmin._id.toString() });
+    // 获取≤2级员工范围（TL直推+TL组长组+子TL直推 NOT IN 子TL组长组）
+    // 1. TL直推
+    const directEmployees = await Employee.find({ parentId: currentAdmin._id.toString() });
+    // 2. TL自己的组长组
+    const groups = await TeamGroup.find({ teamLeaderId: currentAdmin._id.toString(), status: { $ne: 'disbanded' } }).lean();
+    const groupNames = groups.map(g => g.groupName).filter(Boolean);
+    const groupIds = groups.map(g => String(g._id));
+    let groupEmployees = [];
+    if (groupNames.length || groupIds.length) {
+      const rawGrp = await Employee.find({ $or: [{ groupName: { $in: groupNames } }, { teamGroupId: { $in: groupIds } }] }).select('employeeId teamGroupId groupName').lean();
+      const gidsS = new Set(groupIds); const gnmsS = new Set(groupNames);
+      groupEmployees = rawGrp.filter(e => {
+        const gid = e.teamGroupId ? String(e.teamGroupId) : '';
+        const gn = e.groupName || '';
+        return gidsS.has(gid) || gnmsS.has(gn);
+      });
+    }
+    // 3. 下属TL直属（排除下属TL自己的组长组 = 超2级）
+    let subTlDirectEmployees = [];
+    const subTls = await Admin.find({
+      parentTlId: currentAdmin._id,
+      role: { $in: ['NORMAL_ADMIN', 'normal_admin'] }
+    }).select('_id').lean();
+    for (const stl of subTls) {
+      const stlId = String(stl._id);
+      const stlAll = await Employee.find({ parentId: stlId }).select('employeeId groupName teamGroupId').lean();
+      const stlGroups = await TeamGroup.find({ teamLeaderId: stl._id, status: { $ne: 'disbanded' } }).lean();
+      const sgids = new Set(stlGroups.map(g => String(g._id)));
+      const sgnms = new Set(stlGroups.map(g => g.groupName).filter(Boolean));
+      stlAll.forEach(e => {
+        const gid = e.teamGroupId ? String(e.teamGroupId) : '';
+        const gn = e.groupName || '';
+        if (!sgids.has(gid) && !sgnms.has(gn)) subTlDirectEmployees.push(e);
+      });
+    }
+    // 合并去重（≤2级）
+    const em = new Map();
+    directEmployees.forEach(e => em.set(String(e.employeeId), e));
+    groupEmployees.forEach(e => em.set(String(e.employeeId), e));
+    subTlDirectEmployees.forEach(e => em.set(String(e.employeeId), e));
+    const employees = Array.from(em.values());
     const employeeIds = employees.map(e => e.employeeId);
     
     if (employeeIds.length === 0) {
@@ -2102,12 +2313,8 @@ router.get('/team-leader/revenue', authMiddleware, async (req, res) => {
       });
     }
 
-    // 获取团队下的所有组别
-    const groups = await TeamGroup.find({ teamLeaderId: currentAdmin._id.toString() });
     const groupById = {};
-    groups.forEach(g => {
-      groupById[g._id.toString()] = g;
-    });
+    groups.forEach(g => { groupById[g._id.toString()] = g; });
 
     // 时间范围计算
     const beijingNow = getBeijingDate();
@@ -2141,22 +2348,38 @@ router.get('/team-leader/revenue', authMiddleware, async (req, res) => {
       // 今日数据
       GoldLog.aggregate([
         { $match: { employeeId: { $in: employeeIds }, createTime: { $gte: todayStart } } },
-        { $group: { _id: null, totalGold: { $sum: '$gold' } } }
+        { $group: { 
+          _id: null, 
+          totalGold: { $sum: '$gold' },
+          filteredGold: { $sum: { $cond: [{ $lte: ['$gold', 2000] }, '$gold', 0] } }
+        } }
       ]),
       // 本月数据
       GoldLog.aggregate([
         { $match: { employeeId: { $in: employeeIds }, createTime: { $gte: monthStart } } },
-        { $group: { _id: null, totalGold: { $sum: '$gold' } } }
+        { $group: { 
+          _id: null, 
+          totalGold: { $sum: '$gold' },
+          filteredGold: { $sum: { $cond: [{ $lte: ['$gold', 2000] }, '$gold', 0] } }
+        } }
       ]),
       // 上月数据
       GoldLog.aggregate([
         { $match: { employeeId: { $in: employeeIds }, createTime: { $gte: lastMonthStart, $lt: lastMonthEnd } } },
-        { $group: { _id: null, totalGold: { $sum: '$gold' } } }
+        { $group: { 
+          _id: null, 
+          totalGold: { $sum: '$gold' },
+          filteredGold: { $sum: { $cond: [{ $lte: ['$gold', 2000] }, '$gold', 0] } }
+        } }
       ]),
       // 累计数据
       GoldLog.aggregate([
         { $match: { employeeId: { $in: employeeIds } } },
-        { $group: { _id: null, totalGold: { $sum: '$gold' } } }
+        { $group: { 
+          _id: null, 
+          totalGold: { $sum: '$gold' },
+          filteredGold: { $sum: { $cond: [{ $lte: ['$gold', 2000] }, '$gold', 0] } }
+        } }
       ])
     ]);
 
@@ -2168,16 +2391,20 @@ router.get('/team-leader/revenue', authMiddleware, async (req, res) => {
         matchCondition.createTime.$lt = end;
       }
       
-      // 一次性查询所有员工的金币记录
+      // 一次性查询所有员工的金币记录（含 filteredGold）
       const allGoldLogs = await GoldLog.aggregate([
         { $match: matchCondition },
-        { $group: { _id: '$employeeId', totalGold: { $sum: '$gold' } } }
+        { $group: { 
+          _id: '$employeeId', 
+          totalGold: { $sum: '$gold' },
+          filteredGold: { $sum: { $cond: [{ $lte: ['$gold', 2000] }, '$gold', 0] } }
+        } }
       ]);
       
-      // 按员工ID构建映射
+      // 按员工ID构建映射（使用 filteredGold 计算提成）
       const goldByEmployee = {};
       allGoldLogs.forEach(log => {
-        goldByEmployee[log._id] = log.totalGold;
+        goldByEmployee[log._id] = log.filteredGold || 0; // 提成计算用过滤后的金币
       });
       
       // 在JavaScript中按组计算
@@ -2205,23 +2432,21 @@ router.get('/team-leader/revenue', authMiddleware, async (req, res) => {
       calculateGroupLeaderRevenueOptimized(new Date(0))
     ]);
 
-    // 计算各时间范围的收益
-    const calculateFinalRevenue = (totalGold, groupRevenue) => {
-      const teamUserRevenue = (totalGold || 0) / 1000;
-      const teamCommissionRevenue = (teamUserRevenue * 0.2) - groupRevenue;
-      return Math.max(0, teamCommissionRevenue);
-    };
-
-    const todayRevenue = calculateFinalRevenue(todayStats[0]?.totalGold, todayGroupRevenue);
-    const thisMonthRevenue = calculateFinalRevenue(monthStats[0]?.totalGold, monthGroupRevenue);
-    const lastMonthRevenue = calculateFinalRevenue(lastMonthStats[0]?.totalGold, lastMonthGroupRevenue);
-    const totalRevenue = calculateFinalRevenue(totalStats[0]?.totalGold, totalGroupRevenue);
-
+    // 团队长提成直接复用 computeNewKpi（与≤2级规则一致，含级差提成，非硬编码20%）
+    const tlScope = { kind: 'TL', adminId: String(currentAdmin._id) };
+    const [todayKpi, monthKpi, lastMonthKpi, allKpi] = await Promise.all([
+      computeNewKpi(tlScope, 'today'),
+      computeNewKpi(tlScope, 'month'),
+      computeNewKpi(tlScope, 'lastMonth'),
+      computeNewKpi(tlScope, 'all'),
+    ]);
+    
+    const n2 = v => +(+v || 0).toFixed(2);
     const resultData = {
-      today: parseFloat(todayRevenue.toFixed(2)),
-      thisMonth: parseFloat(thisMonthRevenue.toFixed(2)),
-      lastMonth: parseFloat(lastMonthRevenue.toFixed(2)),
-      total: parseFloat(totalRevenue.toFixed(2))
+      today: n2(todayKpi.teamCommission),
+      thisMonth: n2(monthKpi.teamCommission),
+      lastMonth: n2(lastMonthKpi.teamCommission),
+      total: n2(allKpi.teamCommission)
     };
 
     // 设置缓存
@@ -2308,6 +2533,257 @@ router.get('/team-leader/commission', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error('获取团队长团队提成收益数据错误:', error);
+    res.status(500).json({ success: false, message: '服务器错误' });
+  }
+});
+
+// ==================== 管理者直属业绩卡列表（超管/高管）====================
+router.get('/super/manager-direct-cards', authMiddleware, async (req, res) => {
+  try {
+    const { range = 'today', limit } = req.query;
+    const limitNum = limit ? Math.min(parseInt(limit, 10) || 2000, 5000) : 2000;
+
+    const currentAdmin = await Admin.findById(req.user.id).lean();
+    if (!currentAdmin) return res.status(403).json({ success: false, message: '管理员不存在' });
+
+    const role = String(currentAdmin.role || '').toUpperCase();
+    const isSuper = role === 'SUPER_ADMIN' || currentAdmin.role === 'superadmin';
+    const isMgr = role === 'ADMIN_MANAGER' || currentAdmin.role === 'admin_manager';
+
+    if (!isSuper && !isMgr) {
+      return res.status(403).json({ success: false, message: '无权限访问' });
+    }
+
+    // 收集管辖范围内的管理者（团队长 + 组长）
+    const n2 = v => +(+v || 0).toFixed(2);
+    const safeInt = v => +(+v || 0);
+
+    let managers = [];
+
+    if (isSuper) {
+      // 超管：所有团队长 + 组长
+      const allAdmins = await Admin.find({
+        role: { $in: ['NORMAL_ADMIN', 'normal_admin', 'GROUP_LEADER', 'group_leader'] }
+      }).select('_id username realName role teamName commission createdAt teamGroupId parentTlId employeeId level').lean();
+
+      // 团队长
+      const tlDocs = allAdmins.filter(a => String(a.role || '').toUpperCase() === 'NORMAL_ADMIN');
+      // 组长
+      const glDocs = allAdmins.filter(a => String(a.role || '').toUpperCase() !== 'NORMAL_ADMIN');
+
+      // 收集每个 TL 下属的 GL 组长
+      const glTLMap = new Map();
+      glDocs.forEach(gl => {
+        const tlId = gl.parentTlId ? String(gl.parentTlId) : null;
+        if (!tlId) return;
+        if (!glTLMap.has(tlId)) glTLMap.set(tlId, []);
+        glTLMap.get(tlId).push(gl);
+      });
+
+      // 1) 团队长卡
+      for (const tl of tlDocs) {
+        const tlId = String(tl._id);
+        const tlScope = { kind: 'TL', adminId: tlId };
+        const tlToday = await computeNewKpi(tlScope, 'today');
+        const tlMonth = await computeNewKpi(tlScope, 'month');
+        const tlYesterday = await computeNewKpi(tlScope, 'yesterday');
+        const memberCount = (tlToday._debug?.dCount || 0) + (tlToday._debug?.iCount || 0);
+
+        managers.push({
+          realName: tl.realName || '',
+          username: tl.username || '',
+          userId: tlId,
+          _id: tlId,
+          objectId: tlId,
+          adminId: tlId,
+          employeeId: tl.employeeId || '',
+          role: 'NORMAL_ADMIN',
+          teamName: tl.teamName || '',
+          team: tl.teamName || '',
+          level: tl.level || '',
+          commissionRate: n2(tl.commission || 0),
+          rate: n2(tl.commission || 0),
+          commission: n2(tl.commission || 0),
+          memberCount: safeInt(memberCount),
+          todayActive: safeInt(tlToday.directActiveUsers || 0),
+          todayRevenue: n2(tlToday.teamRevenue),
+          monthlyRevenue: n2(tlMonth.teamRevenue),
+          yesterdayRevenue: n2(tlYesterday.teamRevenue),
+          todayAdCount: safeInt(tlToday.directImpressions || 0),
+          impressions: safeInt(tlToday.directImpressions || 0),
+          totalAds: safeInt(tlToday.directImpressions || 0),
+          avgEcpm: n2(tlToday.teamRevenue > 0 && tlToday.directImpressions > 0
+            ? (tlToday.teamRevenue / tlToday.directImpressions) * 1000 : 0),
+          ecpm: n2(tlToday.teamRevenue > 0 && tlToday.directImpressions > 0
+            ? (tlToday.teamRevenue / tlToday.directImpressions) * 1000 : 0),
+          avgGold: n2(tlToday.teamRevenue),
+          createdAt: tl.createdAt ? tl.createdAt.toISOString() : null,
+          _scope: 'TL'
+        });
+
+        // 2) 下属组长卡
+        const subGLs = glTLMap.get(tlId) || [];
+        for (const gl of subGLs) {
+          const glId = String(gl._id);
+          const glScope = { kind: 'GL', adminId: glId, teamGroupId: gl.teamGroupId };
+          const glToday = await computeNewKpi(glScope, 'today');
+          const glMonth = await computeNewKpi(glScope, 'month');
+          const glYesterday = await computeNewKpi(glScope, 'yesterday');
+          const glMemberCount = (glToday._debug?.dCount || 0) + (glToday._debug?.iCount || 0);
+
+          managers.push({
+            realName: gl.realName || '',
+            username: gl.username || '',
+            userId: glId,
+            _id: glId,
+            objectId: glId,
+            adminId: glId,
+            employeeId: gl.employeeId || '',
+            role: 'GROUP_LEADER',
+            teamName: tl.teamName || '',
+            team: tl.teamName || '',
+            level: gl.level || '',
+            commissionRate: 0.05,
+            rate: 0.05,
+            commission: 0.05,
+            memberCount: safeInt(glMemberCount),
+            todayActive: safeInt(glToday.directActiveUsers || 0),
+            todayRevenue: n2(glToday.teamRevenue),
+            monthlyRevenue: n2(glMonth.teamRevenue),
+            yesterdayRevenue: n2(glYesterday.teamRevenue),
+            todayAdCount: safeInt(glToday.directImpressions || 0),
+            impressions: safeInt(glToday.directImpressions || 0),
+            totalAds: safeInt(glToday.directImpressions || 0),
+            avgEcpm: n2(glToday.teamRevenue > 0 && glToday.directImpressions > 0
+              ? (glToday.teamRevenue / glToday.directImpressions) * 1000 : 0),
+            ecpm: n2(glToday.teamRevenue > 0 && glToday.directImpressions > 0
+              ? (glToday.teamRevenue / glToday.directImpressions) * 1000 : 0),
+            avgGold: n2(glToday.teamRevenue),
+            createdAt: gl.createdAt ? gl.createdAt.toISOString() : null,
+            _scope: 'GL'
+          });
+        }
+      }
+    } else {
+      // 高管：只返回 managedTeamIds 范围内的 TL 及其下属 GL
+      const managedIds = (currentAdmin.managedTeamIds || []).map(id => String(id));
+      if (managedIds.length === 0) {
+        return res.json({ success: true, data: [], total: 0 });
+      }
+
+      const tlDocs = await Admin.find({
+        _id: { $in: managedIds.map(id => mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : id) },
+        role: { $in: ['NORMAL_ADMIN', 'normal_admin'] }
+      }).select('_id username realName role teamName commission createdAt teamGroupId parentTlId employeeId level').lean();
+
+      const glDocs = await Admin.find({
+        parentTlId: { $in: managedIds },
+        role: { $in: ['GROUP_LEADER', 'group_leader'] }
+      }).select('_id username realName role teamName commission createdAt teamGroupId parentTlId employeeId level').lean();
+
+      const glTLMap = new Map();
+      glDocs.forEach(gl => {
+        const tlId = gl.parentTlId ? String(gl.parentTlId) : null;
+        if (!tlId) return;
+        if (!glTLMap.has(tlId)) glTLMap.set(tlId, []);
+        glTLMap.get(tlId).push(gl);
+      });
+
+      for (const tl of tlDocs) {
+        const tlId = String(tl._id);
+        const tlScope = { kind: 'TL', adminId: tlId };
+        const tlToday = await computeNewKpi(tlScope, 'today');
+        const tlMonth = await computeNewKpi(tlScope, 'month');
+        const tlYesterday = await computeNewKpi(tlScope, 'yesterday');
+        const memberCount = (tlToday._debug?.dCount || 0) + (tlToday._debug?.iCount || 0);
+
+        managers.push({
+          realName: tl.realName || '',
+          username: tl.username || '',
+          userId: tlId,
+          _id: tlId,
+          objectId: tlId,
+          adminId: tlId,
+          employeeId: tl.employeeId || '',
+          role: 'NORMAL_ADMIN',
+          teamName: tl.teamName || '',
+          team: tl.teamName || '',
+          level: tl.level || '',
+          commissionRate: n2(tl.commission || 0),
+          rate: n2(tl.commission || 0),
+          commission: n2(tl.commission || 0),
+          memberCount: safeInt(memberCount),
+          todayActive: safeInt(tlToday.directActiveUsers || 0),
+          todayRevenue: n2(tlToday.teamRevenue),
+          monthlyRevenue: n2(tlMonth.teamRevenue),
+          yesterdayRevenue: n2(tlYesterday.teamRevenue),
+          todayAdCount: safeInt(tlToday.directImpressions || 0),
+          impressions: safeInt(tlToday.directImpressions || 0),
+          totalAds: safeInt(tlToday.directImpressions || 0),
+          avgEcpm: n2(tlToday.teamRevenue > 0 && tlToday.directImpressions > 0
+            ? (tlToday.teamRevenue / tlToday.directImpressions) * 1000 : 0),
+          ecpm: n2(tlToday.teamRevenue > 0 && tlToday.directImpressions > 0
+            ? (tlToday.teamRevenue / tlToday.directImpressions) * 1000 : 0),
+          avgGold: n2(tlToday.teamRevenue),
+          createdAt: tl.createdAt ? tl.createdAt.toISOString() : null,
+          _scope: 'TL'
+        });
+
+        const subGLs = glTLMap.get(tlId) || [];
+        for (const gl of subGLs) {
+          const glId = String(gl._id);
+          const glScope = { kind: 'GL', adminId: glId, teamGroupId: gl.teamGroupId };
+          const glToday = await computeNewKpi(glScope, 'today');
+          const glMonth = await computeNewKpi(glScope, 'month');
+          const glYesterday = await computeNewKpi(glScope, 'yesterday');
+          const glMemberCount = (glToday._debug?.dCount || 0) + (glToday._debug?.iCount || 0);
+
+          managers.push({
+            realName: gl.realName || '',
+            username: gl.username || '',
+            userId: glId,
+            _id: glId,
+            objectId: glId,
+            adminId: glId,
+            employeeId: gl.employeeId || '',
+            role: 'GROUP_LEADER',
+            teamName: tl.teamName || '',
+            team: tl.teamName || '',
+            level: gl.level || '',
+            commissionRate: 0.05,
+            rate: 0.05,
+            commission: 0.05,
+            memberCount: safeInt(glMemberCount),
+            todayActive: safeInt(glToday.directActiveUsers || 0),
+            todayRevenue: n2(glToday.teamRevenue),
+            monthlyRevenue: n2(glMonth.teamRevenue),
+            yesterdayRevenue: n2(glYesterday.teamRevenue),
+            todayAdCount: safeInt(glToday.directImpressions || 0),
+            impressions: safeInt(glToday.directImpressions || 0),
+            totalAds: safeInt(glToday.directImpressions || 0),
+            avgEcpm: n2(glToday.teamRevenue > 0 && glToday.directImpressions > 0
+              ? (glToday.teamRevenue / glToday.directImpressions) * 1000 : 0),
+            ecpm: n2(glToday.teamRevenue > 0 && glToday.directImpressions > 0
+              ? (glToday.teamRevenue / glToday.directImpressions) * 1000 : 0),
+            avgGold: n2(glToday.teamRevenue),
+            createdAt: gl.createdAt ? gl.createdAt.toISOString() : null,
+            _scope: 'GL'
+          });
+        }
+      }
+    }
+
+    // 排序：今日业绩降序
+    managers.sort((a, b) => (b.todayRevenue || 0) - (a.todayRevenue || 0));
+    const limited = managers.slice(0, limitNum);
+
+    res.json({
+      success: true,
+      data: limited,
+      total: managers.length
+    });
+  } catch (error) {
+    console.error('管理者业绩卡错误:', error);
     res.status(500).json({ success: false, message: '服务器错误' });
   }
 });
@@ -2449,19 +2925,108 @@ function ptlRateExprForSub(gl, subOwnRate, fallback) {
   return inferred;
 }
 
-// 聚合 GoldLog 数据并计算提成
-async function aggWithRate(ids, s, e, rateFn) {
+// 聚合 GoldLog 数据并计算提成（聚合管道版本）
+// rateConfig: { type: 'direct'|'indirect'|'gl', fallback, subOwnRate?, diffRate? }
+async function aggWithRate(ids, s, e, rateConfig) {
   const GoldLog = mongoose.model('GoldLog');
-  const logs = await GoldLog.find({ employeeId: { $in: ids }, createTime: { $gte: s, $lt: e } })
-    .select('employeeId gold commissionRate tlCommissionRate parentTlCommissionRate').lean();
-  let count = 0, totalGold = 0, commGold = 0;
-  for (const l of logs) {
-    count++;
-    const g = +l.gold || 0;
-    totalGold += g;
-    commGold += g * rateFn(l);
+  
+  let rateExpr;
+  
+  if (rateConfig.type === 'gl' || rateConfig.type === 'direct_gl') {
+    rateExpr = rateConfig.fallback;
+    
+  } else if (rateConfig.type === 'direct') {
+    // 团队长算自己直属员工提成
+    // 优先级：commissionRate > tlCommissionRate > fallback
+    //   commissionRate > 0 → 组内员工历史记录，当时的组长提成
+    //   tlCommissionRate > 0 → 直属员工记录，全率
+    rateExpr = {
+      $cond: [
+        { $and: [
+          { $gt: [{ $ifNull: ['$commissionRate', 0] }, 0] },
+          { $lte: [{ $ifNull: ['$commissionRate', 0] }, 1] }
+        ]},
+        '$commissionRate',
+        { $cond: [
+          { $and: [
+            { $gt: [{ $ifNull: ['$tlCommissionRate', 0] }, 0] },
+            { $lte: [{ $ifNull: ['$tlCommissionRate', 0] }, 1] }
+          ]},
+          '$tlCommissionRate',
+          rateConfig.fallback
+        ]}
+      ]
+    };
+    
+  } else if (rateConfig.type === 'indirect') {
+    // 团队长算间推级差
+    // 优先级：jcCommissionRate > parentTlCommissionRate > (tlCommissionRate - commissionRate) > fallback
+    //   jcCommissionRate → 新记录，直接固化好的级差，直接用
+    //   parentTlCommissionRate → 旧直属员工记录，上上级级差
+    //   tlCommissionRate - commissionRate → 旧组内员工记录，级差 = TL全率 - 组长率
+    const MIN_INDIRECT_RATE = 0.02;
+    const fallbackDiff = rateConfig.diffRate && rateConfig.diffRate > 0 ? rateConfig.diffRate : MIN_INDIRECT_RATE;
+
+    const jcRate = { $ifNull: ['$jcCommissionRate', 0] };
+    const ptlRate = { $ifNull: ['$parentTlCommissionRate', 0] };
+    const tlRate = { $ifNull: ['$tlCommissionRate', 0] };
+    const commRate = { $ifNull: ['$commissionRate', 0] };
+
+    // 旧组内员工记录级差：tlCommissionRate(TL全率) - commissionRate(组长率)，保底2%
+    const tlCommDiff = {
+      $cond: [
+        { $gt: [{ $subtract: [tlRate, commRate] }, 0] },
+        { $subtract: [tlRate, commRate] },
+        MIN_INDIRECT_RATE
+      ]
+    };
+
+    rateExpr = {
+      $cond: [
+        // 1) 新记录：jcCommissionRate 直接固化好的级差
+        { $and: [{ $gt: [jcRate, 0] }, { $lte: [jcRate, 1] }] },
+        jcRate,
+        { $cond: [
+          // 2) 旧直属员工记录：parentTlCommissionRate
+          { $and: [{ $gt: [ptlRate, 0] }, { $lte: [ptlRate, 1] }] },
+          ptlRate,
+          { $cond: [
+            // 3) 旧组内员工记录：tlCommissionRate - commissionRate
+            { $and: [{ $gt: [tlRate, 0] }, { $gt: [commRate, 0] }] },
+            tlCommDiff,
+            // 4) fallback
+            fallbackDiff
+          ]}
+        ]}
+      ]
+    };
+    
+  } else {
+    return { count: 0, totalGold: 0, commGold: 0 };
   }
-  return { count, totalGold, commGold };
+  
+  const result = await GoldLog.aggregate([
+    { $match: { employeeId: { $in: ids }, createTime: { $gte: s, $lt: e } } },
+    { $group: {
+      _id: null,
+      count: { $sum: 1 },
+      totalGold: { $sum: { $ifNull: ['$gold', 0] } },
+      commGold: { $sum: {
+        $cond: [
+          { $lte: [{ $ifNull: ['$gold', 0] }, 2000] },
+          { $multiply: [{ $ifNull: ['$gold', 0] }, rateExpr] },
+          0
+        ]
+      }}
+    }}
+  ]).exec();
+  
+  if (result.length === 0) return { count: 0, totalGold: 0, commGold: 0 };
+  return {
+    count: result[0].count,
+    totalGold: +result[0].totalGold || 0,
+    commGold: +result[0].commGold || 0
+  };
 }
 
 // ==================== 辅助函数：团队长/组长KPI计算 ====================
@@ -2495,7 +3060,7 @@ async function computeNewKpi(scope, range) {
   if (scope.kind === 'TL') {
     // 直推员工（D员工）- 排除下属组成员
     const directEmps = await Employee.find({ parentId: scope.adminId }).select('employeeId groupName teamGroupId').lean();
-    const adminGroups = await TeamGroup.find({ teamLeaderId: scope.adminId }).lean();
+    const adminGroups = await TeamGroup.find({ teamLeaderId: scope.adminId, status: { $ne: 'disbanded' } }).lean();
     const groupIds = adminGroups.map(g => String(g._id));
     const groupNames = adminGroups.map(g => g.groupName).filter(Boolean);
     
@@ -2505,18 +3070,21 @@ async function computeNewKpi(scope, range) {
       return !groupIds.includes(gid) && !groupNames.includes(gn);
     }).map(e => e.employeeId);
     
-    // 下属组长的G员工
+    // 下属组长的G员工（F1 二次校验防同名 groupName 串组）
     if (groupIds.length > 0 || groupNames.length > 0) {
-      const groupEmps = await Employee.find({
+      const allowedGroupIds = new Set(groupIds);
+      const allowedGroupNames = new Set(groupNames);
+      const groupEmpsRaw = await Employee.find({
         $or: [
           { teamGroupId: { $in: groupIds } },
           { groupName: { $in: groupNames } }
         ]
-      }).select('employeeId').lean();
+      }).select('employeeId teamGroupId groupName').lean();
+      const groupEmps = router._f1_validateGroupEmps(groupEmpsRaw, { allowedGroupIds, allowedGroupNames });
       groupEmpIds = groupEmps.map(e => e.employeeId);
     }
     
-    // 下属TL及其D员工
+    // 下属TL及其直属员工（注意：最多2级，排除下属TL自己的组长组员工！）
     const subTls = await Admin.find({
       parentTlId: scope.adminId,
       role: { $in: ['NORMAL_ADMIN', 'normal_admin'] }
@@ -2525,8 +3093,17 @@ async function computeNewKpi(scope, range) {
     for (const subTl of subTls) {
       const subTlId = String(subTl._id);
       const subTlRate = +(subTl.commission || 0);
-      const subTlDirectEmps = await Employee.find({ parentId: subTlId }).select('employeeId').lean();
-      const subTlDirectIds = subTlDirectEmps.map(e => e.employeeId);
+      const subTlDirectEmpsRaw = await Employee.find({ parentId: subTlId }).select('employeeId groupName teamGroupId').lean();
+      // 查询下属TL自己的组长组（TeamGroup.teamLeaderId=子TL）
+      const subTlGroups = await TeamGroup.find({ teamLeaderId: subTl._id, status: { $ne: 'disbanded' } }).lean();
+      const subTlGroupIds = new Set(subTlGroups.map(g => String(g._id)));
+      const subTlGroupNames = new Set(subTlGroups.map(g => g.groupName).filter(Boolean));
+      // 过滤：只保留 parentId=subTlId 且 NOT IN 子TL组长组的员工（<=2级规则，避免下属TL的组长组员工作为第3级混入）
+      const subTlDirectIds = subTlDirectEmpsRaw.filter(e => {
+        const gid = e.teamGroupId ? String(e.teamGroupId) : '';
+        const gn = e.groupName || '';
+        return !subTlGroupIds.has(gid) && !subTlGroupNames.has(gn);
+      }).map(e => e.employeeId);
       if (subTlDirectIds.length > 0) {
         subTlInfo.push({ adminId: subTlId, ids: subTlDirectIds, rate: subTlRate });
       }
@@ -2553,55 +3130,68 @@ async function computeNewKpi(scope, range) {
   
   if (directEmpIds.length > 0) {
     // 组长视角使用 glRateExprRate，团队长视角使用 dRateExprRate
-    const rateFn = scope.kind === 'GL' 
-      ? (l) => glRateExprRate(l, tlFallbackRate) 
-      : (l) => dRateExprRate(l, tlFallbackRate);
-      
-    const dCur = await aggWithRate(directEmpIds, start, end, rateFn);
-    dCurCount = dCur.count;
-    dCurGold = dCur.totalGold;
-    dCurComm = dCur.commGold;
+    const rateConfig = scope.kind === 'GL' 
+      ? { type: 'gl', fallback: tlFallbackRate }
+      : { type: 'direct', fallback: tlFallbackRate };
     
-    const dPrev = await aggWithRate(directEmpIds, prevStart, prevEnd, rateFn);
-    dPrevCount = dPrev.count;
-    dPrevGold = dPrev.totalGold;
-    dPrevComm = dPrev.commGold;
+    const [dCur, dPrev] = await Promise.all([
+      aggWithRate(directEmpIds, start, end, rateConfig),
+      aggWithRate(directEmpIds, prevStart, prevEnd, rateConfig)
+    ]);
+    dCurCount = dCur.count; dCurGold = dCur.totalGold; dCurComm = dCur.commGold;
+    dPrevCount = dPrev.count; dPrevGold = dPrev.totalGold; dPrevComm = dPrev.commGold;
   }
   
   // 计算间推提成（组长员工 + 下属TL员工）
   let iCurCount = 0, iCurGold = 0, iCurComm = 0;
+  let iPrevCount = 0, iPrevGold = 0, iPrevComm = 0;
   
-  // 组长员工：级差 = 上级率(tlFallbackRate) - 组长率(0.05)
+  // 组长员工：级差 = (tlFallbackRate - glOwnRate) <= 0 时保底 2%
   const glOwnRate = 0.05;
+  const glRawDiff = tlFallbackRate - glOwnRate;
+  const glDiffRate = glRawDiff <= 0 ? 0.02 : glRawDiff;
   if (groupEmpIds.length > 0) {
-    const gCur = await aggWithRate(groupEmpIds, start, end, l => ptlRateExprForSub(l, glOwnRate, Math.max(0, tlFallbackRate - glOwnRate)));
-    iCurCount += gCur.count;
-    iCurGold += gCur.totalGold;
-    iCurComm += gCur.commGold;
+    const [gCur, gPrev] = await Promise.all([
+      aggWithRate(groupEmpIds, start, end, {
+        type: 'indirect', subOwnRate: glOwnRate,
+        diffRate: glDiffRate
+      }),
+      aggWithRate(groupEmpIds, prevStart, prevEnd, {
+        type: 'indirect', subOwnRate: glOwnRate,
+        diffRate: glDiffRate
+      })
+    ]);
+    iCurCount += gCur.count; iCurGold += gCur.totalGold; iCurComm += gCur.commGold;
+    iPrevCount += gPrev.count; iPrevGold += gPrev.totalGold; iPrevComm += gPrev.commGold;
   }
   
-  // 下属TL员工：级差 = 上级率(tlFallbackRate) - 下属TL率
+  // 下属TL员工：级差 = (tlFallbackRate - subTlRate) <= 0 时保底 2%
   for (const sub of subTlInfo) {
     const subOwnRate = sub.rate || 0;
-    const subCur = await aggWithRate(sub.ids, start, end, l => ptlRateExprForSub(l, subOwnRate, Math.max(0, tlFallbackRate - subOwnRate)));
-    iCurCount += subCur.count;
-    iCurGold += subCur.totalGold;
-    iCurComm += subCur.commGold;
+    const subRawDiff = tlFallbackRate - subOwnRate;
+    const subDiffRate = subRawDiff <= 0 ? 0.02 : subRawDiff;
+    const rc = { type: 'indirect', subOwnRate, diffRate: subDiffRate };
+    const [subCur, subPrev] = await Promise.all([
+      aggWithRate(sub.ids, start, end, rc),
+      aggWithRate(sub.ids, prevStart, prevEnd, rc)
+    ]);
+    iCurCount += subCur.count; iCurGold += subCur.totalGold; iCurComm += subCur.commGold;
+    iPrevCount += subPrev.count; iPrevGold += subPrev.totalGold; iPrevComm += subPrev.commGold;
   }
   
   // 业绩和提成转换为元
   const dRevenue = safeToFixed2(revToYuan(dCurGold));
   const dCommission = safeToFixed2(revToYuan(dCurComm));
-  const iRevenue = safeToFixed2(revToYuan(iCurGold));
-  const iCommission = safeToFixed2(revToYuan(iCurComm));
-  const teamRevenue = safeToFixed2(dRevenue + iRevenue);
-  const teamCommission = safeToFixed2(dCommission + iCommission);
-  
-  // 上期数据（简化计算）
   const dPrevRevenue = safeToFixed2(revToYuan(dPrevGold));
   const dPrevCommission = safeToFixed2(revToYuan(dPrevComm));
-  const iPrevRevenue = safeToFixed2(revToYuan(0)); // 简化：间推上期不计算
+  const iRevenue = safeToFixed2(revToYuan(iCurGold));
+  const iCommission = safeToFixed2(revToYuan(iCurComm));
+  const iPrevRevenue = safeToFixed2(revToYuan(iPrevGold));
+  const iPrevCommission = safeToFixed2(revToYuan(iPrevComm));
+  const teamRevenue = safeToFixed2(dRevenue + iRevenue);
+  const teamCommission = safeToFixed2(dCommission + iCommission);
   const teamRevenuePrev = safeToFixed2(dPrevRevenue + iPrevRevenue);
+  const teamCommissionPrev = safeToFixed2(dPrevCommission + iPrevCommission);
   
   // 活跃用户数 - 使用金币记录（有金币记录才算活跃）
   const GoldLog = mongoose.model('GoldLog');
@@ -2626,19 +3216,39 @@ async function computeNewKpi(scope, range) {
   const teamRevenueGrowth = teamRevenuePrev > 0 
     ? round1((teamRevenue - teamRevenuePrev) / teamRevenuePrev * 100) 
     : 0;
-  const teamCommissionGrowth = teamCommission > 0 
-    ? round1((teamCommission - dPrevCommission) / Math.max(0.01, dPrevCommission) * 100) 
+  const teamCommissionGrowth = teamCommissionPrev > 0
+    ? round1((teamCommission - teamCommissionPrev) / teamCommissionPrev * 100)
+    : 0;
+  const directRevenueGrowth = dPrevRevenue > 0
+    ? round1((dRevenue - dPrevRevenue) / dPrevRevenue * 100)
+    : 0;
+  const directCommissionGrowth = dPrevCommission > 0
+    ? round1((dCommission - dPrevCommission) / dPrevCommission * 100)
+    : 0;
+  const indirectRevenueGrowth = iPrevRevenue > 0
+    ? round1((iRevenue - iPrevRevenue) / iPrevRevenue * 100)
+    : 0;
+  const indirectCommissionGrowth = iPrevCommission > 0
+    ? round1((iCommission - iPrevCommission) / iPrevCommission * 100)
     : 0;
   
   return {
     directRevenue: dRevenue,
+    directPrevRevenue: dPrevRevenue,
     indirectRevenue: iRevenue,
+    indirectPrevRevenue: iPrevRevenue,
     teamRevenue,
+    teamRevenuePrev,
     directCommission: dCommission,
+    directPrevCommission: dPrevCommission,
     indirectCommission: iCommission,
+    indirectPrevCommission: iPrevCommission,
     teamCommission,
+    teamCommissionPrev,
     directImpressions: dCurCount,
+    directPrevImpressions: dPrevCount,
     indirectImpressions: iCurCount,
+    indirectPrevImpressions: iPrevCount,
     directUserCount: dirTotalN,
     indirectUserCount: indirTotalN,
     directActiveUsers: activeUserCount,
@@ -2647,7 +3257,10 @@ async function computeNewKpi(scope, range) {
     indirectActiveRate: 0,
     teamRevenueGrowth,
     teamCommissionGrowth,
-    directRevenueGrowth: 0,
+    directRevenueGrowth,
+    directCommissionGrowth,
+    indirectRevenueGrowth,
+    indirectCommissionGrowth,
     _scope: scope.kind === 'TL' ? 'TL' : 'GL',
     _range: range,
     _window: { startISO: start.toISOString(), endISO: end.toISOString() },
@@ -2657,20 +3270,84 @@ async function computeNewKpi(scope, range) {
 
 function getEmptyKpi() {
   return {
-    directRevenue: 0, indirectRevenue: 0, teamRevenue: 0,
-    directCommission: 0, indirectCommission: 0, teamCommission: 0,
-    directImpressions: 0, indirectImpressions: 0,
+    directRevenue: 0, directPrevRevenue: 0,
+    indirectRevenue: 0, indirectPrevRevenue: 0,
+    teamRevenue: 0, teamRevenuePrev: 0,
+    directCommission: 0, directPrevCommission: 0,
+    indirectCommission: 0, indirectPrevCommission: 0,
+    teamCommission: 0, teamCommissionPrev: 0,
+    directImpressions: 0, directPrevImpressions: 0,
+    indirectImpressions: 0, indirectPrevImpressions: 0,
     directUserCount: 0, indirectUserCount: 0,
     directActiveUsers: 0, indirectActiveUsers: 0,
     directActiveRate: 0, indirectActiveRate: 0,
-    teamRevenueGrowth: 0, teamCommissionGrowth: 0, directRevenueGrowth: 0,
+    teamRevenueGrowth: 0, teamCommissionGrowth: 0,
+    directRevenueGrowth: 0, directCommissionGrowth: 0,
+    indirectRevenueGrowth: 0, indirectCommissionGrowth: 0,
     _scope: 'TL', _range: '', _window: { startISO: '', endISO: '' },
     _debug: { dCount: 0, iCount: 0 }
   };
 }
 
-// ==================== 辅助函数：超管/高管KPI计算 ====================
-async function computeSuperKpi(range, teamIds) {
+// ==================== 辅助函数：计算员工范围（可预计算复用）====================
+async function computeEmployeeScope(teamIds) {
+  const Admin = mongoose.model('Admin');
+  const Employee = mongoose.model('Employee');
+  const TeamGroup = mongoose.model('TeamGroup');
+  
+  let scopeEmpIds = null;
+  let allTlIds = [];
+  let allGlIds = [];
+  
+  if (!teamIds || teamIds.length === 0) {
+    const allTls = await Admin.find({ role: { $in: ['NORMAL_ADMIN', 'normal_admin'] } }).select('_id').lean();
+    allTlIds = allTls.map(t => String(t._id));
+    
+    const allGroups = await TeamGroup.find({ status: { $ne: 'disbanded' } }).select('_id teamLeaderId groupLeaderId').lean();
+    const groupIds = allGroups.map(g => String(g._id));
+    allGlIds = [...new Set(allGroups.map(g => g.groupLeaderId).filter(id => id).map(id => String(id)))];
+    
+    const allEmps = await Employee.find({
+      $or: [
+        { parentId: { $in: allTlIds } },
+        { teamGroupId: { $in: groupIds } }
+      ]
+    }).select('employeeId').lean();
+    scopeEmpIds = [...new Set(allEmps.map(e => e.employeeId))];
+  } else {
+    const managedIdStrings = teamIds.map(id => String(id));
+    const directTlIds = managedIdStrings;
+    
+    const subTls = await Admin.find({
+      parentTlId: { $in: directTlIds },
+      role: { $in: ['NORMAL_ADMIN', 'normal_admin'] }
+    }).select('_id').lean();
+    const subTlIds = subTls.map(t => String(t._id));
+    allTlIds = [...new Set([...directTlIds, ...subTlIds])];
+    
+    const allGroups = await TeamGroup.find({ 
+      teamLeaderId: { $in: allTlIds }, 
+      status: { $ne: 'disbanded' } 
+    }).select('_id groupLeaderId').lean();
+    const groupIds = allGroups.map(g => String(g._id));
+    allGlIds = [...new Set(allGroups.map(g => g.groupLeaderId).filter(id => id).map(id => String(id)))];
+    
+    const allEmps = await Employee.find({
+      $or: [
+        { parentId: { $in: allTlIds } },
+        { teamGroupId: { $in: groupIds } }
+      ]
+    }).select('employeeId').lean();
+    scopeEmpIds = [...new Set(allEmps.map(e => e.employeeId))];
+  }
+  
+  return { scopeEmpIds, allTlIds, allGlIds };
+}
+
+// ==================== 辅助函数：超管/高管KPI计算（统一口径）====================
+// 口径：businessRevenue=ecpm总计, userShareCommission=gold/1000, managementCommission=TL+GL提成
+// 区别：teamIds为空=全量，有值=指定范围；precomputedScope可预计算员工范围
+async function computeSuperKpi(range, teamIds, precomputedScope) {
   const { start, end, prevStart, prevEnd } = _getKpiTimeRange(range);
   const Admin = mongoose.model('Admin');
   const Employee = mongoose.model('Employee');
@@ -2680,60 +3357,39 @@ async function computeSuperKpi(range, teamIds) {
   const safeToFixed2 = (v) => +(+v || 0).toFixed(2);
   const round1 = (v) => +(+v || 0).toFixed(1);
   
-  // 确定员工范围
-  let scopeEmpIds = null;
-  if (teamIds && teamIds.length > 0) {
-    const managedIdStrings = teamIds.map(id => String(id));
-    
-    // 找下属TL
-    const subTls = await Admin.find({
-      parentTlId: { $in: managedIdStrings },
-      role: { $in: ['NORMAL_ADMIN', 'normal_admin'] }
-    }).select('_id').lean();
-    const subTlIds = subTls.map(t => String(t._id));
-    
-    // 找下属组
-    const allGroups = await TeamGroup.find({ teamLeaderId: { $in: [...managedIdStrings, ...subTlIds] } }).select('_id').lean();
-    const groupIds = allGroups.map(g => String(g._id));
-    
-    // 收集员工
-    const allEmps = await Employee.find({
-      $or: [
-        { parentId: { $in: managedIdStrings } },
-        { parentId: { $in: subTlIds } },
-        { teamGroupId: { $in: groupIds } }
-      ]
-    }).select('employeeId').lean();
-    
-    scopeEmpIds = [...new Set(allEmps.map(e => e.employeeId))];
+  // 确定员工范围（优先使用预计算结果）
+  let scopeEmpIds, allTlIds, allGlIds;
+  if (precomputedScope) {
+    scopeEmpIds = precomputedScope.scopeEmpIds;
+    allTlIds = precomputedScope.allTlIds;
+    allGlIds = precomputedScope.allGlIds;
+  } else {
+    const scope = await computeEmployeeScope(teamIds);
+    scopeEmpIds = scope.scopeEmpIds;
+    allTlIds = scope.allTlIds;
+    allGlIds = scope.allGlIds;
   }
   
-  // 聚合数据
-  const pipe = [];
+  // ===== 准备三个并行查询管线 =====
+  
+  // 1) 主业绩聚合
+  const mainPipe = [];
   const matchStage = { createTime: { $gte: start, $lt: end } };
   if (scopeEmpIds && scopeEmpIds.length > 0) {
     matchStage.employeeId = { $in: scopeEmpIds };
   }
-  pipe.push({ $match: matchStage });
-  pipe.push({
+  mainPipe.push({ $match: matchStage });
+  mainPipe.push({
     $group: {
       _id: null,
       count: { $sum: 1 },
       totalGold: { $sum: { $ifNull: ['$gold', 0] } },
       totalEcpm: { $sum: { $ifNull: ['$ecpm', 0] } },
-      filteredGold: { $sum: { $cond: [{ $lte: ['$gold', 10000] }, { $ifNull: ['$gold', 0] }, 0] } }
+      filteredGold: { $sum: { $cond: [{ $lte: [{ $ifNull: ['$gold', 0] }, 2000] }, { $ifNull: ['$gold', 0] }, 0] } }
     }
   });
   
-  const rows = await GoldLog.aggregate(pipe).allowDiskUse(true).exec();
-  const r = rows[0] || { count: 0, totalGold: 0, totalEcpm: 0, filteredGold: 0 };
-  
-  const businessRevenue = safeToFixed2((+r.totalEcpm || 0) / 1000);
-  const userShareCommission = safeToFixed2((+r.totalGold || 0) / 1000);
-  const impressions = r.count || 0;
-  const ecpmAvg = impressions > 0 ? safeToFixed2((+r.totalEcpm || 0) / impressions) : 0;
-  
-  // 环比数据
+  // 2) 环比业绩聚合
   const prevPipe = [];
   const prevMatchStage = { createTime: { $gte: prevStart, $lt: prevEnd } };
   if (scopeEmpIds && scopeEmpIds.length > 0) {
@@ -2743,32 +3399,106 @@ async function computeSuperKpi(range, teamIds) {
   prevPipe.push({
     $group: {
       _id: null,
-      totalEcpm: { $sum: { $ifNull: ['$ecpm', 0] } },
       totalGold: { $sum: { $ifNull: ['$gold', 0] } },
-      count: { $sum: 1 }
+      totalEcpm: { $sum: { $ifNull: ['$ecpm', 0] } },
+      count: { $sum: 1 },
+      filteredGold: { $sum: { $cond: [{ $lte: [{ $ifNull: ['$gold', 0] }, 2000] }, { $ifNull: ['$gold', 0] }, 0] } }
     }
   });
   
-  const prevRows = await GoldLog.aggregate(prevPipe).allowDiskUse(true).exec();
-  const pr = prevRows[0] || { totalEcpm: 0, totalGold: 0, count: 0 };
-  
-  const prevBusinessRevenue = safeToFixed2((+pr.totalEcpm || 0) / 1000);
-  const prevUserShareCommission = safeToFixed2((+pr.totalGold || 0) / 1000);
-  
-  // 活跃用户数
+  // 3) 活跃用户查询
   const loginMatch = { loginDate: { $gte: start, $lt: end } };
   if (scopeEmpIds && scopeEmpIds.length > 0) {
     loginMatch.employeeId = { $in: scopeEmpIds };
   }
-  const activeUsers = await LoginRecord.find(loginMatch).distinct('userId');
-  const activeUserCount = activeUsers.length;
-  
   const prevLoginMatch = { loginDate: { $gte: prevStart, $lt: prevEnd } };
   if (scopeEmpIds && scopeEmpIds.length > 0) {
     prevLoginMatch.employeeId = { $in: scopeEmpIds };
   }
-  const prevActiveUsers = await LoginRecord.find(prevLoginMatch).distinct('userId');
-  const prevActiveUserCount = prevActiveUsers.length;
+  
+  // 4) 准备 GL 提成批量查询
+  const glGroupMap = {};
+  if (allGlIds.length > 0) {
+    const allGlGroups = await TeamGroup.find({
+      groupLeaderId: { $in: allGlIds },
+      status: { $ne: 'disbanded' }
+    }).select('groupLeaderId _id').lean();
+    for (const g of allGlGroups) {
+      const gid = String(g.groupLeaderId);
+      if (!glGroupMap[gid]) glGroupMap[gid] = [];
+      glGroupMap[gid].push(String(g._id));
+    }
+  }
+  
+  // 并发限制函数：控制最大并发数
+  async function runWithConcurrencyLimit(tasks, limit) {
+    const results = [];
+    let nextIndex = 0;
+    const runner = async () => {
+      while (nextIndex < tasks.length) {
+        const index = nextIndex++;
+        results[index] = await tasks[index]();
+      }
+    };
+    await Promise.all(Array(Math.min(limit, tasks.length)).fill(null).map(() => runner()));
+    return results;
+  }
+  
+  const tlTasks = allTlIds.map(tlId => 
+    () => computeNewKpi({ kind: 'TL', adminId: tlId }, range)
+  );
+  const glTasks = [];
+  for (const glId of allGlIds) {
+    const gids = glGroupMap[glId];
+    if (gids && gids.length > 0) {
+      glTasks.push(() => computeNewKpi({ kind: 'GL', adminId: glId, teamGroupId: gids[0] }, range));
+    }
+  }
+  
+  // ===== 分步执行，降低数据库压力 =====
+  // 第1步：主聚合+环比+活跃用户（4路轻量并行）
+  const [rows, prevRows, activeUserCounts, prevActiveUserCounts] = await Promise.all([
+    GoldLog.aggregate(mainPipe).exec(),
+    GoldLog.aggregate(prevPipe).exec(),
+    LoginRecord.aggregate([{ $match: loginMatch }, { $group: { _id: '$userId' } }, { $count: 'total' }]).exec(),
+    LoginRecord.aggregate([{ $match: prevLoginMatch }, { $group: { _id: '$userId' } }, { $count: 'total' }]).exec()
+  ]);
+  
+  // 第2步：TL 提成计算（串行，最多2并发）
+  const tlResults = await runWithConcurrencyLimit(tlTasks, 2);
+  
+  // 第3步：GL 提成计算（串行，最多2并发）
+  const glResults = await runWithConcurrencyLimit(glTasks, 2);
+  
+  // ===== 汇总主业绩数据 =====
+  const r = rows[0] || { count: 0, totalGold: 0, totalEcpm: 0 };
+  const businessRevenue = safeToFixed2((+r.totalEcpm || 0) / 1000);
+  const impressions = r.count || 0;
+  const ecpmAvg = impressions > 0 ? safeToFixed2((+r.totalEcpm || 0) / impressions) : 0;
+  const userShareCommission = safeToFixed2((+r.totalGold || 0) / 1000);
+  const dividendUserShare = safeToFixed2((+r.filteredGold || 0) / 1000);  // 分红用：过滤 gold>2000
+  
+  // ===== 汇总环比业绩数据 =====
+  const pr = prevRows[0] || { totalGold: 0, totalEcpm: 0, count: 0, filteredGold: 0 };
+  const prevBusinessRevenue = safeToFixed2((+pr.totalEcpm || 0) / 1000);
+  const prevUserShareCommission = safeToFixed2((+pr.totalGold || 0) / 1000);
+  const prevDividendUserShare = safeToFixed2((+pr.filteredGold || 0) / 1000);  // 环比分红用
+  const activeUserCount = activeUserCounts[0]?.total || 0;
+  const prevActiveUserCount = prevActiveUserCounts[0]?.total || 0;
+  
+  // ===== 汇总提成数据 =====
+  let managementCommission = 0;
+  let prevManagementCommission = 0;
+  for (const kpi of tlResults) {
+    managementCommission += kpi.teamCommission;
+    prevManagementCommission += kpi.teamCommissionPrev;
+  }
+  for (const kpi of glResults) {
+    managementCommission += kpi.teamCommission;
+    prevManagementCommission += kpi.teamCommissionPrev;
+  }
+  managementCommission = safeToFixed2(managementCommission);
+  prevManagementCommission = safeToFixed2(prevManagementCommission);
   
   // 增长率
   const businessRevenueGrowth = prevBusinessRevenue > 0 
@@ -2777,52 +3507,70 @@ async function computeSuperKpi(range, teamIds) {
   const userShareGrowth = prevUserShareCommission > 0 
     ? round1((userShareCommission - prevUserShareCommission) / prevUserShareCommission * 100) 
     : 0;
+  const managementCommissionGrowth = prevManagementCommission > 0 
+    ? round1((managementCommission - prevManagementCommission) / prevManagementCommission * 100) 
+    : 0;
   const impressionsGrowth = pr.count > 0 
     ? round1((impressions - pr.count) / pr.count * 100) 
     : 0;
-  const ecpmAvgGrowth = pr.count > 0 
-    ? round1((ecpmAvg - ((+pr.totalEcpm || 0) / pr.count)) / ((+pr.totalEcpm || 0) / pr.count) * 100) 
+  const prevEcpmAvg = pr.count > 0 ? safeToFixed2((+pr.totalEcpm || 0) / pr.count) : 0;
+  const ecpmAvgGrowth = prevEcpmAvg > 0 
+    ? round1((ecpmAvg - prevEcpmAvg) / prevEcpmAvg * 100) 
     : 0;
   
-  // 简化计算管理分成
-  const managementCommission = safeToFixed2(businessRevenue * 0.3);
-  const managementCommissionGrowth = prevBusinessRevenue > 0 
-    ? round1((managementCommission - safeToFixed2(prevBusinessRevenue * 0.3)) / safeToFixed2(prevBusinessRevenue * 0.3) * 100) 
+  // 分红 = 过滤后用户分成金额×25% - 管理分成
+  const expectedCommission = dividendUserShare * 0.25;
+  const dividendTotal = safeToFixed2(Math.max(0, expectedCommission - managementCommission));
+  const prevExpectedCommission = prevDividendUserShare * 0.25;
+  const prevDividendTotal = safeToFixed2(Math.max(0, prevExpectedCommission - prevManagementCommission));
+  const dividendTotalGrowth = prevDividendTotal > 0 
+    ? round1((dividendTotal - prevDividendTotal) / prevDividendTotal * 100) 
     : 0;
   
-  // 简化计算分红
-  const filteredUserShare = safeToFixed2((+r.filteredGold || 0) / 1000);
-  const dividendTotalRaw = filteredUserShare * 0.25 - managementCommission;
-  const dividendTotal = safeToFixed2(Math.max(0, dividendTotalRaw));
-  const dividendTotalGrowth = prevBusinessRevenue > 0 
-    ? round1((dividendTotal - safeToFixed2(Math.max(0, safeToFixed2(prevUserShareCommission * 0.25) - safeToFixed2(prevBusinessRevenue * 0.3)))) / Math.max(0, safeToFixed2(prevUserShareCommission * 0.25) - safeToFixed2(prevBusinessRevenue * 0.3)) * 100) 
+  // 活跃用户环比
+  const activeUserGrowth = prevActiveUserCount > 0 
+    ? round1((activeUserCount - prevActiveUserCount) / prevActiveUserCount * 100) 
     : 0;
   
-  // 平台毛利
-  const platformProfit = safeToFixed2(businessRevenue - userShareCommission - managementCommission);
+  // 新增用户（暂无数据源，返回 0）
+  const newUserCount = 0;
+  const prevNewUserCount = 0;
+  const newUserCountGrowth = 0;
+  
+  // 平台毛利 = 业务总收入 - 用户分成金额 - 管理分成 - 分红
+  const platformProfit = safeToFixed2(businessRevenue - userShareCommission - managementCommission - dividendTotal);
+  const prevPlatformProfit = safeToFixed2(prevBusinessRevenue - prevUserShareCommission - prevManagementCommission - prevDividendTotal);
+  const platformProfitGrowth = prevPlatformProfit > 0 
+    ? round1((platformProfit - prevPlatformProfit) / prevPlatformProfit * 100) 
+    : 0;
   const platformProfitRate = businessRevenue > 0 ? round1(platformProfit / businessRevenue * 100) : 0;
+  const platformProfitRateGrowth = prevBusinessRevenue > 0 
+    ? round1((platformProfitRate - (prevPlatformProfit / prevBusinessRevenue * 100)) / Math.max(0.01, prevPlatformProfit / prevBusinessRevenue * 100) * 100)
+    : 0;
   
   return {
     businessRevenue,
+    businessRevenueGrowth,
     userShareCommission,
+    userShareGrowth,
     managementCommission,
-    dividendTotal,
-    newUserCount: 0,
+    managementCommissionGrowth,
     platformProfit,
+    platformProfitGrowth,
     platformProfitRate,
+    platformProfitRateGrowth,
+    dividendTotal,
+    dividendTotalGrowth,
     impressions,
+    impressionsGrowth,
     ecpmAvg,
-    registeredUserCount: scopeEmpIds ? scopeEmpIds.length : 0,
+    ecpmAvgGrowth,
     activeUserCount,
     activeUserRate: scopeEmpIds && scopeEmpIds.length > 0 ? round1(activeUserCount / scopeEmpIds.length * 100) : 0,
-    businessRevenueGrowth,
-    userShareGrowth,
-    managementCommissionGrowth,
-    dividendTotalGrowth,
-    platformProfitGrowth: businessRevenueGrowth,
-    platformProfitRateGrowth: round1(platformProfitRate * 0.1),
-    impressionsGrowth,
-    ecpmAvgGrowth
+    activeUserGrowth,
+    newUserCount,
+    newUserCountGrowth,
+    registeredUserCount: scopeEmpIds ? scopeEmpIds.length : 0
   };
 }
 
@@ -2858,11 +3606,11 @@ router.get('/super/kpi', authMiddleware, async (req, res) => {
       teamIds = currentAdmin.managedTeamIds.map(id => String(id));
     }
     
-    // 计算KPI
+    // 计算KPI（超管和高管统一口径，区别在员工范围）
     const kpi = await computeSuperKpi(range, teamIds);
     
-    // 设置缓存
-    setCache(cacheKey, kpi, range === 'today' ? 60 * 1000 : 60 * 60 * 1000);
+    // 设置缓存：今日5分钟，其他1小时
+    setCache(cacheKey, kpi, range === 'today' ? 5 * 60 * 1000 : 60 * 60 * 1000);
     
     res.json({ success: true, data: kpi });
   } catch (error) {
@@ -2875,10 +3623,13 @@ router.get('/super/kpi', authMiddleware, async (req, res) => {
 router.get('/super/dividend-summary', authMiddleware, async (req, res) => {
   try {
     const adminId = req.user.id;
+    const forceRefresh = req.query.refresh === '1';
     const cacheKey = `dividend_summary_${adminId}`;
-    const cachedData = getFromCache(cacheKey);
-    if (cachedData) {
-      return res.json({ success: true, data: cachedData, cached: true });
+    if (!forceRefresh) {
+      const cachedData = getFromCache(cacheKey);
+      if (cachedData) {
+        return res.json({ success: true, data: cachedData, cached: true });
+      }
     }
     
     const Admin = mongoose.model('Admin');
@@ -2899,11 +3650,14 @@ router.get('/super/dividend-summary', authMiddleware, async (req, res) => {
     const safeToFixed2 = (v) => +(+v || 0).toFixed(2);
     const teamIds = currentAdmin.managedTeamIds ? currentAdmin.managedTeamIds.map(id => String(id)) : null;
     
-    // 计算三个时间范围
+    // 预计算员工范围（三个时间范围共用，避免重复查询）
+    const employeeScope = await computeEmployeeScope(teamIds);
+    
+    // 计算三个时间范围（超管和高管统一口径）
     const [today, month, lastMonth] = await Promise.all([
-      computeSuperKpi('today', teamIds),
-      computeSuperKpi('month', teamIds),
-      computeSuperKpi('lastMonth', teamIds)
+      computeSuperKpi('today', teamIds, employeeScope),
+      computeSuperKpi('month', teamIds, employeeScope),
+      computeSuperKpi('lastMonth', teamIds, employeeScope)
     ]);
     
     // 计算可提现余额
@@ -2931,13 +3685,13 @@ router.get('/super/dividend-summary', authMiddleware, async (req, res) => {
     }
     
     const result = {
-      today: { dividendTotal: today.dividendTotal, businessRevenue: today.businessRevenue, userShareCommission: today.userShareCommission, managementCommission: today.managementCommission },
-      month: { dividendTotal: month.dividendTotal, businessRevenue: month.businessRevenue, userShareCommission: month.userShareCommission, managementCommission: month.managementCommission },
-      lastMonth: { dividendTotal: lastMonth.dividendTotal, businessRevenue: lastMonth.businessRevenue, userShareCommission: lastMonth.userShareCommission, managementCommission: lastMonth.managementCommission },
+      todayDividend: safeToFixed2(today.dividendTotal),
+      monthDividend: safeToFixed2(month.dividendTotal),
+      lastMonthDividend: safeToFixed2(lastMonth.dividendTotal),
       availableBalance: safeToFixed2(availableBalance)
     };
     
-    setCache(cacheKey, result, 60 * 60 * 1000);
+    setCache(cacheKey, result, 5 * 60 * 1000);
     res.json({ success: true, data: result });
   } catch (error) {
     console.error('高管分红汇总错误:', error);
@@ -2948,6 +3702,7 @@ router.get('/super/dividend-summary', authMiddleware, async (req, res) => {
 // ==================== 导出辅助函数 ====================
 router.computeSuperKpi = computeSuperKpi;
 router.computeNewKpi = computeNewKpi;
+router.computeEmployeeScope = computeEmployeeScope;
 router._getKpiTimeRange = _getKpiTimeRange;
 router._TEST_getTlCommissionStats = async function(adminId) {
   const Admin = mongoose.model('Admin');
@@ -2963,6 +3718,141 @@ router._TEST_getTlCommissionStats = async function(adminId) {
     lastMonth: kpi.teamCommission,
     total: kpi.teamCommission,
     availableBalance: 0
+  };
+};
+
+// ================================================================
+// Helper 导出（供 verification.js 中 getTeamLeaderPerformance 复用）
+// 100% 复用 KPI/团队员工范围、Rate 口径，确保 业绩Tab ↔ 团队Tab(KPI) 一致
+// ================================================================
+
+/**
+ * 直推员工ID集合（parentId === TL Admin ID）
+ * @param {string} tlIdStr TL Admin._id.toString()
+ * @returns {Promise<string[]>} employeeId 字符串数组
+ */
+router._getTLDirectDIds = async function _getTLDirectDIds(tlIdStr) {
+  const emps = await Employee.find({ parentId: String(tlIdStr) }).select('employeeId').lean().exec();
+  return emps.map(e => String(e.employeeId));
+};
+
+/**
+ * F1 下属组员工归属二次校验工具函数（防同名 groupName 串组）
+ *
+ * 背景：Employee 查询常常用 `$or:[{groupName:{$in:names}},{teamGroupId:{$in:ids}}]`，
+ *  如果另一个 TL 也拥有同名 groupName，那 groupName 匹配会把"不属于本 TL 但同名字符串的组员工"也拉进来，
+ *  导致 A TL 看板算到 B TL 组的业绩（串组 Bug）。
+ *
+ * 本函数在"Employee $or 查出 emps"之后做二次内存过滤，规则：
+ *  1) 若员工 teamGroupId 非空（有精确组 ID） → 必须在允许的 allowedGroupIds 集合内（100% 不串）
+ *  2) 若员工 teamGroupId 为空（历史脏数据只填了 groupName 字符串） → groupName 必须在本 TL 名下的 allowedGroupNames 集合内
+ *  3) teamGroupId + groupName 双空 → 孤儿员工，保留（直推员工/D员工）
+ *
+ * @param {Array<{teamGroupId: any, groupName: string|null, employeeId: string}>} emps Employee $or 查出的员工
+ * @param {{allowedGroupIds: Set<string>, allowedGroupNames: Set<string>}} opts 允许的组 ID / 组名集合（必须是 scopeAdmin 名下的 TeamGroup）
+ * @returns {Array} 过滤后只属于 scopeAdmin 下属组的员工数组
+ */
+router._f1_validateGroupEmps = function _f1_validateGroupEmps(emps, opts) {
+  if (!emps || !emps.length) return [];
+  const allowedGroupIds = opts.allowedGroupIds || new Set();
+  const allowedGroupNames = opts.allowedGroupNames || new Set();
+  return emps.filter(e => {
+    const gid = e.teamGroupId ? String(e.teamGroupId) : '';
+    const gn = e.groupName || '';
+    if (gid) return allowedGroupIds.has(gid);
+    if (gn) return allowedGroupNames.has(gn);
+    return true;
+  });
+};
+
+/**
+ * 组长下属组 G 员工ID集合：TeamGroup.teamLeaderId === TL._id，再查 Employee 组名/teamGroupId 匹配（F1 二次校验防同名串组）
+ * @param {string} tlIdStr TL Admin._id.toString()
+ * @returns {Promise<string[]>} employeeId 字符串数组
+ */
+router._getTLSubGroupGIds = async function _getTLSubGroupGIds(tlIdStr) {
+  const tlGroups = await TeamGroup.find({
+    teamLeaderId: mongoose.Types.ObjectId.isValid(tlIdStr) ? new mongoose.Types.ObjectId(tlIdStr) : tlIdStr,
+    status: { $ne: 'disbanded' }
+  }).select('_id groupName').lean().exec();
+  const names = tlGroups.map(g => g.groupName).filter(Boolean);
+  const ids = tlGroups.map(g => String(g._id));
+  if (!names.length && !ids.length) return [];
+  const allowedGroupIds = new Set(ids);
+  const allowedGroupNames = new Set(names);
+  const $or = [];
+  if (names.length) $or.push({ groupName: { $in: names } });
+  if (ids.length) $or.push({ teamGroupId: { $in: ids } });
+  if (ids.length) $or.push({ teamGroupId: { $in: ids.map(i => mongoose.Types.ObjectId.isValid(i) ? new mongoose.Types.ObjectId(i) : i) } });
+  const empsRaw = await Employee.find({ $or }).select('employeeId teamGroupId groupName').lean().exec();
+  const emps = router._f1_validateGroupEmps(empsRaw, { allowedGroupIds, allowedGroupNames });
+  return [...new Set(emps.map(e => String(e.employeeId)))];
+};
+
+/**
+ * 直推 Rate MQL 表达式（KPI 同款 dRateExprRate）
+ *  优先级：GoldLog.tlCommissionRate → GoldLog.commissionRate → fallback
+ * @param {number} fallback 兜底提成率（TL 自身配置 commission）
+ * @returns {object} MQL 可嵌入 $multiply 的 rate 表达式
+ */
+router._dRateExpr = function _dRateExpr(fallback) {
+  const hasTl = { $and: [
+    { $ne: [{ $ifNull: ['$tlCommissionRate', null] }, null] },
+    { $gt: ['$tlCommissionRate', 0] },
+    { $lte: ['$tlCommissionRate', 1] }
+  ] };
+  const hasGl = { $and: [
+    { $ne: [{ $ifNull: ['$commissionRate', null] }, null] },
+    { $gt: ['$commissionRate', 0] },
+    { $lte: ['$commissionRate', 1] }
+  ] };
+  return { $cond: [hasTl, '$tlCommissionRate', { $cond: [hasGl, '$commissionRate', fallback] }] };
+};
+
+/**
+ * 下级（组长 G / 下属 TL）级差 Rate MQL 表达式（KPI 同款 ptlRateExprForSub）
+ *  规则：如果 GoldLog.tlCommissionRate 存在且 > subOwnRate → tlCommissionRate - subOwnRate；否则 fallback
+ * @param {number} subOwnRate 下级自身的提成率（组长统一 5%，下属TL按其配置 commission）
+ * @param {number} fallback 兜底级差率（通常 max(0, tlFallbackRate - subOwnRate)）
+ * @returns {object} MQL 表达式
+ */
+router._ptlRateExprForSubordinate = function _ptlRateExprForSubordinate(subOwnRate, fallback) {
+  const tlHas = { $and: [
+    { $ne: [{ $ifNull: ['$tlCommissionRate', null] }, null] },
+    { $gt: ['$tlCommissionRate', 0] },
+    { $lte: ['$tlCommissionRate', 1] }
+  ] };
+  return { $cond: [
+    tlHas,
+    { $max: [0, { $subtract: ['$tlCommissionRate', subOwnRate] }] },
+    fallback
+  ] };
+};
+
+/**
+ * GoldLog 汇总聚合：返回 {totalGold, totalCommissionGold, count}
+ *  KPI 同款：所有记录都会参与计算（无 gold<=2000 过滤）
+ * @param {string[]} ids Employee.employeeId
+ * @param {Date} start UTC 起始（含）
+ * @param {Date} end UTC 结束（不含）
+ * @param {number|object} rate Rate 表达式（来自 _dRateExpr / _ptlRateExprForSubordinate）
+ */
+router._aggGold = async function _aggGold(ids, start, end, rate) {
+  if (!ids || !ids.length) return { totalGold: 0, totalCommissionGold: 0, count: 0 };
+  const rows = await GoldLog.aggregate([
+    { $match: { employeeId: { $in: ids }, createTime: { $gte: start, $lt: end } } },
+    { $group: {
+      _id: null,
+      count: { $sum: 1 },
+      totalGold: { $sum: '$gold' },
+      totalCommissionGold: { $sum: { $multiply: ['$gold', rate] } }
+    } }
+  ], { hint: { employeeId: 1, createTime: 1 } }).exec();
+  const r = rows[0] || { count: 0, totalGold: 0, totalCommissionGold: 0 };
+  return {
+    count: +r.count || 0,
+    totalGold: +r.totalGold || 0,
+    totalCommissionGold: +r.totalCommissionGold || 0
   };
 };
 

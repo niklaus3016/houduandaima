@@ -1377,36 +1377,41 @@ async function getGroupLeaderPerformance(adminId, opts = {}) {
         { teamGroupId: adminDoc._id.toString() },
         { teamGroupId: adminDoc._id }
       ]
-    }).lean().select('employeeId').exec()
+    }).lean().select('employeeId createdAt').exec()
   ]);
   if (!group) throw new Error('组不存在');
   const employeeIds = employees.map(e => e.employeeId);
 
   const COMM = +group.commission || 0;
+  // ======== GL 提成率：组长统一 5%，零回归硬编码，不管 TeamGroup.commission / GoldLog.commissionRate 历史脏值 ========
+  //   ✅ 不读 GoldLog.commissionRate（历史脏数据，可能是 10% / 12%），100% 用常量 0.05
+  const GL_RATE = 0.05;
   // ========== rateExpr（组长自己那份：GL版本，展示给组长端） ==========
-  const rateExpr = {
-    $cond: [
-      { $and: [ { $gt: [ { $ifNull: ['$commissionRate', 0] }, 0 ] }, { $lte: [ { $ifNull: ['$commissionRate', 0] }, 1 ] } ] },
-      '$commissionRate',
-      COMM
-    ]
-  };
-  // ========== tlRateExpr（团队长分层那份：模型A总包抵扣 TL spread） ==========
-  //   1) 新订单（pre save 已固化 tlCommissionRate∈(0,1]）→ 用它（100% 不追溯）
-  //   2) 历史订单（tlCommissionRate 没值）→ 兜底近似模型A：max(0, TL_rate_forContext − GL_rateExpr)
-  //        其中 TL_rate_forContext = 团队长职级最低档 P5.commission（与 pre save 的 D/G 固化 TL_rate 完全一致）
+  const rateExpr = GL_RATE;
+  // ========== tlRateExpr（团队长分层那份：级差 = TL_rate − GL_rate） ==========
+  //   1) 新订单（pre save 已固化 tlCommissionRate∈(0,1]）→ 级差 = max(0, tlCommissionRate − GL_RATE)
+  //   2) 历史订单（tlCommissionRate 没值）→ 级差兜底 = max(0, tlFallbackRateForContext − GL_RATE)
+  //        其中 tlFallbackRateForContext = 「TL Admin 自身配置的 commission」作为历史兜底近似
+  //        先查 TeamGroup.teamLeaderId → TL Admin.commission，取不出再 fallback 配置档 P5
   const sortedLevels = (tlCfgDoc && Array.isArray(tlCfgDoc.levels) && tlCfgDoc.levels.length)
     ? [...tlCfgDoc.levels].sort((a,b) => (a.minRevenue||0)-(b.minRevenue||0))
     : [];
-  const TL_RATE_DEFAULT = 0.20; // 历史兼容兜底（无配置时代理默认 20%）
-  const tlRateForContext = (sortedLevels[0] && typeof sortedLevels[0].commission === 'number')
-    ? +sortedLevels[0].commission
-    : TL_RATE_DEFAULT;
+  const TL_RATE_DEFAULT_FALLBACK = sortedLevels.length ? (+sortedLevels[Math.min(4, sortedLevels.length-1)].commission || 0.12) : 0.12;
+  let tlFallbackRateForContext = TL_RATE_DEFAULT_FALLBACK;
+  try {
+    const tlAdmin = group.teamLeaderId
+      ? await Admin.findById(group.teamLeaderId).select('commission').lean()
+      : null;
+    if (tlAdmin && typeof tlAdmin.commission === 'number' && tlAdmin.commission > 0 && tlAdmin.commission <= 1) {
+      tlFallbackRateForContext = tlAdmin.commission;
+    }
+  } catch (_) { /* 忽略 */ }
+  const tlFallbackDiff = Math.max(0, tlFallbackRateForContext - GL_RATE);
   const tlRateExpr = {
     $cond: [
-      { $and: [ { $gt: [ { $ifNull: ['$tlCommissionRate', 0] }, 0 ] }, { $lte: [ { $ifNull: ['$tlCommissionRate', 0] }, 1 ] } ] },
-      '$tlCommissionRate',
-      { $max: [ 0, { $subtract: [ tlRateForContext, rateExpr ] } ] }
+      { $and: [ { $ne: [{ $ifNull: ['$tlCommissionRate', null] }, null] }, { $gt: ['$tlCommissionRate', 0] }, { $lte: ['$tlCommissionRate', 1] } ] },
+      { $max: [0, { $subtract: ['$tlCommissionRate', GL_RATE] }] },
+      tlFallbackDiff
     ]
   };
 
@@ -1422,8 +1427,16 @@ async function getGroupLeaderPerformance(adminId, opts = {}) {
   const nextFirstUTC = new Date(Date.UTC(lastM === 12 ? lastY + 1 : lastY, lastM === 12 ? 0 : lastM, 1));
   const monthlyEndUTC = new Date(nextFirstUTC.getTime() - 8 * 60 * 60 * 1000);
 
-  // 4. 累计业绩起点 - 限制为最近90天，避免全表扫描
-  const accStart = new Date(Date.now() - 90 * 24 * 3600 * 1000);
+  // 4. 累计业绩起点：按「方向C」对齐月份业绩 — 取该组员工最早 createdAt（比组成立日还早的历史也纳入），避免顶部累计与月合计对不上
+  let historyStartUTC = group.createdAt ? new Date(group.createdAt) : new Date(Date.now() - 365 * 24 * 3600 * 1000);
+  const empDates = employees.map(e => e.createdAt).filter(Boolean).map(d => new Date(d).getTime());
+  if (empDates.length) {
+    const earliestEmp = new Date(Math.min(...empDates));
+    if (earliestEmp.getTime() < historyStartUTC.getTime()) historyStartUTC = earliestEmp;
+  }
+  // 再保守：向前再放宽 15 天，避免 createdAt 当天前的历史 gold 漏掉
+  historyStartUTC = new Date(historyStartUTC.getTime() - 15 * 24 * 3600 * 1000);
+  const accStart = historyStartUTC;
   const accEnd = yesterdayEnd;
 
   const monthlyPipeline = [
@@ -1438,8 +1451,8 @@ async function getGroupLeaderPerformance(adminId, opts = {}) {
           }
         },
         totalGold: { $sum: '$gold' },
-        totalCommissionGold: { $sum: { $cond: [{ $lte: ['$gold', 10000] }, { $multiply: ['$gold', rateExpr] }, 0] } },
-        totalTlCommissionGold: { $sum: { $cond: [{ $lte: ['$gold', 10000] }, { $multiply: ['$gold', tlRateExpr] }, 0] } }   // TL 分层 commission（模型A spread）
+        totalCommissionGold: { $sum: { $multiply: ['$gold', rateExpr] } },
+        totalTlCommissionGold: { $sum: { $multiply: ['$gold', tlRateExpr] } }   // TL 分层 commission（级差）
       }
     }
   ];
@@ -1455,35 +1468,59 @@ async function getGroupLeaderPerformance(adminId, opts = {}) {
           }
         },
         totalGold: { $sum: '$gold' },
-        totalCommissionGold: { $sum: { $cond: [{ $lte: ['$gold', 10000] }, { $multiply: ['$gold', rateExpr] }, 0] } },
-        totalTlCommissionGold: { $sum: { $cond: [{ $lte: ['$gold', 10000] }, { $multiply: ['$gold', tlRateExpr] }, 0] } }   // TL 分层 commission（模型A spread）
+        totalCommissionGold: { $sum: { $multiply: ['$gold', rateExpr] } },
+        totalTlCommissionGold: { $sum: { $multiply: ['$gold', tlRateExpr] } }   // TL 分层 commission（级差）
       }
     }
   ];
   const accPipeline = [
     { $match: { employeeId: { $in: employeeIds }, createTime: { $gte: accStart, $lt: accEnd } } },
-    { $group: { _id: null, totalGold: { $sum: '$gold' } } }
+    { $group: {
+      _id: null,
+      totalGold:             { $sum: '$gold' },
+      totalCommissionGold:   { $sum: { $multiply: ['$gold', rateExpr] } },
+      totalTlCommissionGold: { $sum: { $multiply: ['$gold', tlRateExpr] } }
+    } }
   ];
   const [monthlyRaw, dailyRaw, accRaw] = await Promise.all([
-    GoldLog.aggregate(monthlyPipeline).exec(),
-    GoldLog.aggregate(dailyPipeline).exec(),
-    GoldLog.aggregate(accPipeline).exec()
+    GoldLog.aggregate(monthlyPipeline, { hint: { employeeId: 1, createTime: 1 } }).exec(),
+    GoldLog.aggregate(dailyPipeline,    { hint: { employeeId: 1, createTime: 1 } }).exec(),
+    GoldLog.aggregate(accPipeline,      { hint: { employeeId: 1, createTime: 1 } }).exec()
   ]);
 
   // 5. 组织数据（金币层返回，方便上层加总）
-  const accGold = accRaw[0]?.totalGold || 0;
-  const totalRevenue = +(accGold / 1000).toFixed(2);
+  const accGold           = accRaw[0]?.totalGold || 0;
+  const accCommissionGold = accRaw[0]?.totalCommissionGold || 0;
+  const accTlCommGold     = accRaw[0]?.totalTlCommissionGold || 0;
+  const totalRevenue     = +(accGold / 1000).toFixed(2);
+  const totalCommission  = +(accCommissionGold / 1000).toFixed(2);
+  // 提成率对账兜底：按 rateExpr 是 number 时，保证 totalCommission === totalRevenue * GL_RATE（0.05 统一）
+  if (typeof rateExpr === 'number') {
+    const recon = +(totalRevenue * rateExpr).toFixed(2);
+    if (Math.abs(totalCommission - recon) >= 0.005) {
+      totalCommission = recon;
+    }
+  }
 
   const foundedBJ = new Date(group.createdAt.getTime() + 8 * 60 * 60 * 1000);
   const teamFoundedAt = `${foundedBJ.getUTCFullYear()}-${String(foundedBJ.getUTCMonth() + 1).padStart(2, '0')}-${String(foundedBJ.getUTCDate()).padStart(2, '0')}`;
-  const yStdBJ = new Date(bjNow);
-  yStdBJ.setUTCDate(yStdBJ.getUTCDate() - 1);
-  yStdBJ.setUTCHours(0, 0, 0, 0);
+  // ✅ 运营天数：取「今天北京日期 00:00」减「成立北京日期 00:00」，+1 表示成立当天算1天
+  const todayBJ0 = new Date(bjNow);
+  todayBJ0.setUTCHours(0, 0, 0, 0);
   const foundedDayStart = new Date(Date.UTC(foundedBJ.getUTCFullYear(), foundedBJ.getUTCMonth(), foundedBJ.getUTCDate()));
-  const yesterdayDayStart = new Date(Date.UTC(yStdBJ.getUTCFullYear(), yStdBJ.getUTCMonth(), yStdBJ.getUTCDate()));
-  const operatingDays = Math.max(0, Math.round((yesterdayDayStart - foundedDayStart) / (24 * 60 * 60 * 1000)) + 1);
+  const todayDayStart = new Date(Date.UTC(todayBJ0.getUTCFullYear(), todayBJ0.getUTCMonth(), todayBJ0.getUTCDate()));
+  const operatingDays = Math.max(0, Math.round((todayDayStart - foundedDayStart) / (24 * 60 * 60 * 1000)) + 1);
 
-  const summary = { totalRevenue, teamFoundedAt, operatingDays };
+  const summary = {
+    totalRevenue,
+    totalCommission,
+    teamFoundedAt,
+    operatingDays
+  };
+  // ⭐ _rawGold 补齐累计层 commission，避免团队长复用 _rawGold 再算累计时少字段
+  //    (monthly/daily 层已经在前面算过了，这里只要把 acc 级字段追加到最终 _rawGold 返回里就行)
+  let _rawGoldExtra_accCommissionGold = accCommissionGold;
+  let _rawGoldExtra_accTlCommGold     = accTlCommGold;
 
   // 6. daily 骨架 + 舍入补齐（revenue 和 commission（GL版 + TL版）分别对齐全月合计）
   let totalGoldMonth = 0;
@@ -1635,6 +1672,8 @@ async function getGroupLeaderPerformance(adminId, opts = {}) {
     // ⭐ 团队长端复用：原始金币加总，避免元级舍入误差累计
     _rawGold: {
       accGold,                           // 累计（至昨日）金币
+      accCommissionGold: _rawGoldExtra_accCommissionGold,  // 累计提成金币（GL版）
+      accTlCommGold:     _rawGoldExtra_accTlCommGold,      // 累计提成金币（TL版，级差）
       totalGoldMonth,                    // 当月金币
       totalCommissionGoldMonth,          // 当月提成金币（GL版：sum(gold*commissionRate)）
       totalTlCommissionGoldMonth,        // 当月提成金币（TL版：模型A spread，sum(gold*tlRateExpr)）
@@ -1649,36 +1688,73 @@ async function getGroupLeaderPerformance(adminId, opts = {}) {
       yyyy, mm, daysInMonth, daysPassed,
       groupCreatedAt: group.createdAt,   // 组成立时间
       groupName: group.groupName || '',
-      groupCommission: COMM,             // 当前组展示用比例（GL版）
-      tlRateForContext,                  // TL_rate 历史兜底用的比例（≈P5.commission）
+      groupCommission: GL_RATE,              // 当前组展示用比例（GL版：统一 5%，不读 TeamGroup.commission）
+      tlRateForContext: tlFallbackRateForContext,  // TL_rate 历史兜底用的比例（从所属TL Admin.commission 查得）
     }
   };
 }
 
 /**
- * 解析目标用户（支持 3 种输入）：
- *   1. Admin._id
- *   2. Admin.username （=组长 employeeId，最常用）
- *   3. Employee.employeeId → 再通过 Admin.username 对应找到管理员
+ * 解析目标用户（支持 6 种输入，前端无论传哪种 ID 都不会 404）：
+ *   1. Admin._id                                【习惯A/B 组长都OK，最快单表】
+ *   2. Admin.username                           【组长登录用户名，拼音或数字】
+ *   3. Employee.employeeId → Admin.username     【习惯A：组长 Admin.username = 员工工号，单表兜底】
+ *   4. Employee._id         → Employee.teamGroupId → TeamGroup.groupLeaderId → Admin._id   【习惯B：组长 Admin.username = 拼音，Employee 对象ID 兜底】
+ *   5. Employee.employeeId  → Employee.teamGroupId → TeamGroup.groupLeaderId → Admin._id   【习惯B：员工工号 兜底（习惯A失败时自动走这链）】
+ *   6. TeamGroup._id        → TeamGroup.groupLeaderId → Admin._id                         【如果前端直接传组ID也能定位到组长】
  * 返回 { _id, username, role, teamGroupId, status } 或 null
  */
+async function _adminFromTeamGroupId(tgId) {
+  if (!tgId) return null;
+  const fields = '_id username role teamGroupId status';
+  try {
+    const tg = await TeamGroup.findById(tgId).select('groupLeaderId').lean();
+    if (!tg?.groupLeaderId) return null;
+    const a = await Admin.findById(tg.groupLeaderId).select(fields).lean();
+    if (a) return a;
+    // 再兜底：groupLeaderId 可能存的是 String（ObjectId转字符串），findById 已兼容；若没命中则再按字符串 findOne
+    return await Admin.findOne({ _id: tg.groupLeaderId }).select(fields).lean();
+  } catch (_) { return null; }
+}
 async function resolveTargetAdmin(userQueryStr) {
   const q = (userQueryStr || '').trim();
   if (!q) return null;
   const fields = '_id username role teamGroupId status';
-  // 1) Admin._id
-  try {
-    const byId = await Admin.findById(q).select(fields).lean();
-    if (byId) return byId;
-  } catch (_) {}
-  // 2) Admin.username (= employeeId)
+  const isHex24 = /^[0-9a-fA-F]{24}$/.test(q);
+
+  // 1) Admin._id（ObjectId 或 字符串）
+  if (isHex24) {
+    try { const byId = await Admin.findById(q).select(fields).lean(); if (byId) return byId; } catch (_) {}
+  }
+  // 2) Admin.username (= employeeId 或 拼音用户名)
   const byName = await Admin.findOne({ username: q }).select(fields).lean();
   if (byName) return byName;
-  // 3) Employee.employeeId 兜底 → Admin.username
-  const emp = await Employee.findOne({ employeeId: q }).select('employeeId').lean();
-  if (emp?.employeeId) {
-    const byEmp = await Admin.findOne({ username: emp.employeeId }).select(fields).lean();
+
+  // ================ 以上：两个单表轻量查询，大部分场景命中 ================
+  // ================ 以下：Employee / TeamGroup 链路兜底（F3 新增，防 404） ================
+
+  // 3) Employee.employeeId 数字 → 先按 习惯A：Admin.username 就是员工工号
+  let empByEid = null;
+  try { empByEid = await Employee.findOne({ employeeId: q }).select('_id employeeId teamGroupId').lean(); } catch (_) {}
+  if (empByEid?.employeeId) {
+    const byEmp = await Admin.findOne({ username: empByEid.employeeId }).select(fields).lean();
     if (byEmp) return byEmp;
+    // 习惯A没命中 → 习惯B（Admin.username 是拼音）→ 走 分支 5：Employee.teamGroupId → TeamGroup.groupLeaderId → Admin
+    const viaTg = await _adminFromTeamGroupId(empByEid.teamGroupId);
+    if (viaTg) return viaTg;
+  }
+
+  // 4) Employee._id（MongoDB ObjectId，24 hex）→ Employee.teamGroupId → TeamGroup.groupLeaderId → Admin
+  if (isHex24) {
+    let empById = null;
+    try { empById = await Employee.findById(q).select('_id employeeId teamGroupId').lean(); } catch (_) {}
+    if (empById) {
+      const viaTg = await _adminFromTeamGroupId(empById.teamGroupId);
+      if (viaTg) return viaTg;
+    }
+    // 6) 最后兜底：TeamGroup._id → groupLeaderId → Admin
+    const viaTgDirect = await _adminFromTeamGroupId(q);
+    if (viaTgDirect) return viaTgDirect;
   }
   return null;
 }
@@ -1879,27 +1955,22 @@ async function getTeamLeaderPerformance(teamLeaderId, opts = {}) {
   const lastY = lastMonth._y, lastM = lastMonth._m;
   const nextFirstUTC = new Date(Date.UTC(lastM === 12 ? lastY + 1 : lastY, lastM === 12 ? 0 : lastM, 1));
   const monthlyEndUTC = new Date(nextFirstUTC.getTime() - 8 * 60 * 60 * 1000);
-  // 5c. 累计: 战队成立日 → 昨天（限制为最近90天，避免全表扫描）
-  // ⚡ 修复：晋升的团队长，累计起点应取下属员工最早的入职时间，而非账号创建时间
-  const teamFoundedUTC = tlAdmin.createdAt ? new Date(tlAdmin.createdAt) : new Date(Date.now() - 90 * 24 * 3600 * 1000);
-  let accStart = new Date(Math.max(teamFoundedUTC.getTime(), Date.now() - 90 * 24 * 3600 * 1000));
+  // 5c. 累计: 取下属员工最早 createdAt（未晋升也查）/ 战队成立日 更早那个 - 15天 作为起点，对齐月合计，避免截断对不上
+  const teamFoundedUTC = tlAdmin.createdAt ? new Date(tlAdmin.createdAt) : new Date(Date.now() - 365 * 24 * 3600 * 1000);
+  let historyStart = teamFoundedUTC;
+  try {
+    // 直属D员工 + 组长组G员工（直接用这两大集合算最早createdAt，避免递归）
+    const glAdminGroups = await TeamGroup.find({ teamLeaderId: tlIdStr, status: { $ne: 'disbanded' } }).select('_id').lean();
+    const orConds = [{ parentId: tlIdStr }];
+    glAdminGroups.forEach(g => orConds.push({ teamGroupId: g._id }));
+    const earliestEmp = await Employee.findOne({ $or: orConds }).sort({ createdAt: 1 }).select('createdAt').lean();
+    if (earliestEmp && earliestEmp.createdAt && earliestEmp.createdAt.getTime() < historyStart.getTime()) {
+      historyStart = earliestEmp.createdAt;
+    }
+  } catch (_) { /* 忽略 */ }
+  // 晋升的团队长：如果 promotedAt 前有历史数据，上面 earliestEmp 已经兜底；这里再安全取一次 promotedAt 之前的下限
+  let accStart = new Date(historyStart.getTime() - 15 * 24 * 3600 * 1000);
   const accEnd = yesterdayEnd;
-  
-  // 若该团队长是从组长晋升的（有 promotedAt），则查找下属员工最早的入职时间作为累计起点
-  if (tlAdmin.promotedAt) {
-    try {
-      const earliestEmp = await Employee.findOne({ 
-        $or: [
-          { parentId: tlIdStr },
-          { teamGroupId: tlIdStr }
-        ] 
-      }).sort({ createdAt: 1 }).select('createdAt').lean();
-      if (earliestEmp && earliestEmp.createdAt) {
-        const empCreatedUTC = new Date(earliestEmp.createdAt);
-        accStart = new Date(Math.min(accStart.getTime(), empCreatedUTC.getTime()));
-      }
-    } catch (_) { /* 忽略 */ }
-  }
 
   // 6. 聚合工具：monthly/daily 分桶聚合；acc 总量直接走 dashboard._aggGold
   async function bucketAggregate(ids, start, end, rateExpr, fmt) {
@@ -1909,9 +1980,9 @@ async function getTeamLeaderPerformance(teamLeaderId, opts = {}) {
       { $group: {
         _id: { $dateToString: { format: fmt, date: { $add: ['$createTime', 8*3600*1000] }, timezone: 'UTC' } },
         g: { $sum: '$gold' },
-        c: { $sum: { $cond: [{ $lte: ['$gold', 10000] }, { $multiply: ['$gold', rateExpr] }, 0] } },
+        c: { $sum: { $multiply: ['$gold', rateExpr] } },
       } }
-    ]).exec();
+    ], { hint: { employeeId: 1, createTime: 1 } }).exec();
     const out = {};
     rows.forEach(r => { if (r._id) out[r._id] = { g: +r.g||0, c: +r.c||0 }; });
     return out;
@@ -1976,7 +2047,17 @@ async function getTeamLeaderPerformance(teamLeaderId, opts = {}) {
   //    避免前端只读 groupsRevenue 或只读 subordinateTlRevenue 导致漏算 8~9 万差额
   const indirectRevenue     = +(groupsRevenue + subordinateTlRevenue).toFixed(2);
   const totalRevenue        = +(totalAccGold  / 1000).toFixed(2);
-  const totalCommission     = +(totalAccComm  / 1000).toFixed(2);
+  let totalCommission       = +(totalAccComm  / 1000).toFixed(2);
+  // ✅ 提成拆分（D/G/下属TL → 直/间，前端 TeamLeaderPerformance.tsx 渲染用）
+  const directCommission       = +(directAccComm / 1000).toFixed(2);
+  const groupsCommission       = +(groupsAccComm / 1000).toFixed(2);
+  const subordinateTlCommission = +(subTlAccComm  / 1000).toFixed(2);
+  const indirectCommission     = +(groupsCommission + subordinateTlCommission).toFixed(2);
+  // 对账 0：totalCommission 兜底由 directCommission + indirectCommission 合成（防 _aggGold 舍入累计微差）
+  const reconTotalCommission = +(directCommission + indirectCommission).toFixed(2);
+  if (Math.abs(totalCommission - reconTotalCommission) >= 0.005) {
+    totalCommission = reconTotalCommission;
+  }
 
   // 9. 战队成立时间（ISO 字符串）+ 运营天数（北京时区整日段相减，不含两端都算+1，避免多2天）
   //    例：2026-03-10 03:21 UTC = 2026-03-10 11:21 BJ → 北京成立日=3月10日；今天BJ=7月11日 → 运营123天？
@@ -1996,9 +2077,13 @@ async function getTeamLeaderPerformance(teamLeaderId, opts = {}) {
     totalRevenue,
     totalCommission,
     directRevenue,
-    indirectRevenue,     // ✅ 间推业绩 = groupsRevenue + subordinateTlRevenue 合并，前端直接读
-    groupsRevenue,       // 保留：组长组G员工业绩（间推中的一部分，调试用）
-    subordinateTlRevenue,// 保留：下属一层TL直属D员工业绩（间推中的另一部分，调试用）
+    directCommission,      // ✅ 直推提成（D员工）
+    indirectRevenue,       // ✅ 间推业绩 = groupsRevenue + subordinateTlRevenue 合并，前端直接读
+    indirectCommission,    // ✅ 间推提成（组长组G + 下属一层TL级差提成）
+    groupsRevenue,         // 保留：组长组G员工业绩（间推中的一部分，调试用）
+    groupsCommission,      // 保留：组长组G员工级差提成
+    subordinateTlRevenue,  // 保留：下属一层TL直属D员工业绩（间推中的另一部分，调试用）
+    subordinateTlCommission, // 保留：下属一层TL级差提成
     teamFoundedAt,
     operatingDays,
     teamName: tlAdmin.teamName || ''
@@ -2086,6 +2171,24 @@ async function getTeamLeaderPerformance(teamLeaderId, opts = {}) {
   // ✅ 用 Admin 原表存的 manualLevelSetAt 覆盖 compute 函数的 new Date() 兜底值，前端显示"手动/自动"徽章和设置时间准确
   if (level && tlAdmin?.manualLevel && tlAdmin?.manualLevelSetAt) {
     level.manualLevelSetAt = tlAdmin.manualLevelSetAt;
+  }
+
+  // 🔴 自动同步 Admin.commission：若实时算档的 currentCommission > 数据库存的 commission
+  //     且该 TL 没有手动档（manualLevel），则自动更新——保证历史记录固化用的比例与等级一致
+  //     铁律：只升不降（commission 只能增加，绝不减少）；手动档不自动覆盖
+  if (level?.currentCommission && !tlAdmin?.manualLevel) {
+    const curComm = +level.currentCommission;
+    const dbComm = +(tlAdmin?.commission || 0);
+    if (curComm > dbComm + 0.0001) {
+      try {
+        await Admin.updateOne(
+          { _id: teamLeaderId },
+          { $set: { commission: curComm, updatedAt: new Date() } }
+        );
+        const { clearCommissionCache } = require('../utils/commissionRateCache');
+        clearCommissionCache(teamLeaderId);
+      } catch (_) {}
+    }
   }
   const levelConfig = {
     list: tlLevelCfgList,
@@ -2298,7 +2401,7 @@ router.get('/group-leader/stats', authMiddleware, async (req, res) => {
         }
       }
     ];
-    const [agg] = await GoldLog.aggregate(pipeline).exec();
+    const [agg] = await GoldLog.aggregate(pipeline, { hint: { employeeId: 1, createTime: 1 } }).exec();
 
     const curGold           = +(agg?.curGold           || 0);
     const curCount          = +(agg?.curCount          || 0);
@@ -2580,7 +2683,7 @@ async function promoteGroupLeaderToTeamLeaderLocal(groupLeaderId, who = 'system_
     //    只要员工 teamGroupId 命中"组长Admin._id 或 任一组TeamGroup._id"，都算该组长的老员工 → 迁为TL直属D
     const empQuery = { $or: [{ teamGroupId: gl._id.toString() }] };
     if (oldGroupIds.length) empQuery.$or.push({ teamGroupId: { $in: oldGroupIds } });
-    const empList = await Employee.find(empQuery).select('_id employeeId teamGroupId parentId').lean();
+    const empList = await Employee.find(empQuery).select('_id employeeId teamGroupId parentId groupName').lean();
     const oldEmpIds = empList.map(e => e._id);
 
     // 🔧 加固：finalPromotedAt 保留已有 promotedAt；snapshot 保存真实值用于回滚不破坏
@@ -2636,7 +2739,7 @@ async function promoteGroupLeaderToTeamLeaderLocal(groupLeaderId, who = 'system_
       glRole: gl.role,
       glTeamGroupId: typeof gl.teamGroupId !== 'undefined' ? (gl.teamGroupId ? String(gl.teamGroupId) : null) : undefined,
       oldGroups: oldGroups.map(g => ({ _id: g._id, status: g.status, dissolvedAt: g.dissolvedAt })),
-      oldEmps: empList.map(e => ({ _id: e._id, teamGroupId: e.teamGroupId, parentId: e.parentId })),
+      oldEmps: empList.map(e => ({ _id: e._id, teamGroupId: e.teamGroupId, parentId: e.parentId, groupName: typeof e.groupName !== 'undefined' ? e.groupName : null })),
       glParentTlId: gl.parentTlId || null,
       glPromotedAt: gl.promotedAt || null,
       glCommission: typeof gl.commission === 'number' ? gl.commission : null,
@@ -2660,7 +2763,10 @@ async function promoteGroupLeaderToTeamLeaderLocal(groupLeaderId, who = 'system_
       await TeamGroup.updateMany({ _id: { $in: oldGroupIds } }, { $set: { status: 'disbanded', dissolvedAt: finalPromotedAt } });
     }
     if (oldEmpIds.length) {
-      await Employee.updateMany({ _id: { $in: oldEmpIds } }, { $set: { teamGroupId: null, parentId: gl._id.toString() } });
+      await Employee.updateMany({ _id: { $in: oldEmpIds } }, {
+        $set: { teamGroupId: null, parentId: gl._id.toString() },
+        $unset: { groupName: 1 }
+      });
     }
     invalidateLevelRelatedCaches();
     return {
@@ -2695,7 +2801,13 @@ async function promoteGroupLeaderToTeamLeaderLocal(groupLeaderId, who = 'system_
           await TeamGroup.findByIdAndUpdate(g._id, { $set: { status: g.status || 'active', dissolvedAt: g.dissolvedAt } });
         }
         for (const e of snapshot.oldEmps || []) {
-          await Employee.findByIdAndUpdate(e._id, { $set: { teamGroupId: e.teamGroupId, parentId: e.parentId } });
+          const rollbackEmp = { teamGroupId: e.teamGroupId, parentId: e.parentId };
+          if (e.groupName !== null && e.groupName !== undefined) rollbackEmp.groupName = e.groupName;
+          await Employee.findByIdAndUpdate(e._id, { $set: rollbackEmp });
+          if (e.groupName === null) {
+            // 晋升前 groupName 就不存在（即员工本来就没有组名字段）→ 回滚时保证不要留 $unset 之后的空值，再显式 $unset 一次保险
+            await Employee.findByIdAndUpdate(e._id, { $unset: { groupName: 1 } });
+          }
         }
         invalidateLevelRelatedCaches();
       }
@@ -3037,6 +3149,8 @@ module.exports.LEVEL_V2_DEFAULTS = LEVEL_V2_DEFAULTS;
 module.exports.promoteGroupLeaderToTeamLeaderLocal = promoteGroupLeaderToTeamLeaderLocal;
 module.exports.setAdminManualLevelLocal = setAdminManualLevelLocal;
 module.exports.recomputeAllAdminsCommission = recomputeAllAdminsCommission;
+module.exports.getGroupLeaderPerformance = getGroupLeaderPerformance;
+module.exports.getTeamLeaderPerformance = getTeamLeaderPerformance;
 // 简化版：读 Admin.commission（手动调档/自动晋升后均已更新此字段，GoldLog.pre('save') 可取到最新值）
 module.exports.getGroupLeaderCommission = async function getGroupLeaderCommission(glId) {
   if (!glId) return 0.05;
